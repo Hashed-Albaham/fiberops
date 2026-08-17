@@ -1,4 +1,5 @@
 import { useAuth } from "@/_core/hooks/useAuth";
+import { trpc } from "@/lib/trpc";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
   DropdownMenu,
@@ -19,7 +20,6 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@/components/ui/sidebar";
-import { startLogin } from "@/const";
 import { useIsMobile } from "@/hooks/useMobile";
 import { Boxes, ClipboardCheck, LayoutDashboard, LogOut, PanelLeft, Route, Users } from "lucide-react";
 import { CSSProperties, useEffect, useRef, useState } from "react";
@@ -49,7 +49,24 @@ export default function DashboardLayout({
     const saved = localStorage.getItem(SIDEBAR_WIDTH_KEY);
     return saved ? parseInt(saved, 10) : DEFAULT_WIDTH;
   });
-  const { loading, user } = useAuth();
+  const { loading, user, refresh } = useAuth();
+  const [credentials, setCredentials] = useState({ username: "", password: "" });
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const loginMutation = trpc.auth.login.useMutation({
+    onSuccess: async () => {
+      setLoginError(null);
+      await refresh();
+    },
+    onError: () => {
+      setLoginError("بيانات الدخول غير صحيحة. راجع اسم المستخدم وكلمة المرور.");
+    },
+  });
+
+  const submitLocalLogin = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setLoginError(null);
+    loginMutation.mutate(credentials);
+  };
 
   useEffect(() => {
     localStorage.setItem(SIDEBAR_WIDTH_KEY, sidebarWidth.toString());
@@ -62,20 +79,47 @@ export default function DashboardLayout({
   if (!user) {
     return (
       <div dir="rtl" className="flex min-h-screen items-center justify-center bg-[#081017]">
-        <div className="flex flex-col items-center gap-8 p-8 max-w-md w-full">
+        <form onSubmit={submitLocalLogin} className="flex w-full max-w-md flex-col items-center gap-8 p-8">
           <div className="flex flex-col items-center gap-6">
             <img src="/manus-storage/fiberops-mark_fc6c0774.png" alt="رمز FiberOps" className="h-16 w-16 rounded-2xl border border-[#2F9BFF]/25 bg-[#2F9BFF]/[0.07] p-2" />
             <h1 className="text-center text-2xl font-semibold tracking-tight text-white">الوصول التشغيلي المحمي</h1>
-            <p className="max-w-sm text-center text-sm leading-7 text-slate-400">سجّل الدخول بحسابك للوصول إلى بيانات العمالة والتصاريح والأصول المسجلة في FiberOps.</p>
+            <p className="max-w-sm text-center text-sm leading-7 text-slate-400">أدخل بيانات حساب FiberOps للوصول إلى العمالة والتصاريح والأصول المسجلة.</p>
           </div>
-          <Button
-            onClick={() => startLogin()}
-            size="lg"
-            className="w-full bg-[#2F9BFF] text-[#06111b] shadow-lg hover:bg-[#59b2ff] hover:shadow-xl"
-          >
-            تسجيل الدخول الآمن
-          </Button>
-        </div>
+          <div className="w-full space-y-4">
+            <label className="block space-y-2 text-right">
+              <span className="text-xs font-semibold text-slate-300">اسم المستخدم</span>
+              <input
+                value={credentials.username}
+                onChange={event => setCredentials(current => ({ ...current, username: event.target.value }))}
+                autoComplete="username"
+                required
+                className="h-11 w-full rounded-xl border border-white/10 bg-white/[0.04] px-3 text-sm text-white outline-none transition placeholder:text-slate-600 focus:border-[#2F9BFF] focus:ring-2 focus:ring-[#2F9BFF]/20"
+                placeholder="اسم المستخدم"
+              />
+            </label>
+            <label className="block space-y-2 text-right">
+              <span className="text-xs font-semibold text-slate-300">كلمة المرور</span>
+              <input
+                type="password"
+                value={credentials.password}
+                onChange={event => setCredentials(current => ({ ...current, password: event.target.value }))}
+                autoComplete="current-password"
+                required
+                className="h-11 w-full rounded-xl border border-white/10 bg-white/[0.04] px-3 text-sm text-white outline-none transition placeholder:text-slate-600 focus:border-[#2F9BFF] focus:ring-2 focus:ring-[#2F9BFF]/20"
+                placeholder="كلمة المرور"
+              />
+            </label>
+            {loginError ? <p role="alert" className="text-center text-xs text-rose-300">{loginError}</p> : null}
+            <Button
+              type="submit"
+              size="lg"
+              disabled={loginMutation.isPending}
+              className="w-full bg-[#2F9BFF] text-[#06111b] shadow-lg hover:bg-[#59b2ff] hover:shadow-xl"
+            >
+              {loginMutation.isPending ? "جارٍ التحقق…" : "تسجيل الدخول"}
+            </Button>
+          </div>
+        </form>
       </div>
     );
   }
