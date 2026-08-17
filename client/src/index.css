@@ -120,6 +120,11 @@
 
 ::selection { background: rgb(56 189 248 / 0.28); color: white; }
 
+.field { display: block; }
+.field > span { display: block; margin-bottom: 0.45rem; font-size: 0.75rem; font-weight: 700; color: rgb(203 213 225); }
+.field input, .field select, .field textarea { width: 100%; border-radius: 0.75rem; border: 1px solid rgb(255 255 255 / 0.1); background: #09131d; padding: 0.7rem 0.85rem; color: white; font-size: 0.875rem; outline: none; transition: border-color 160ms ease, box-shadow 160ms ease; }
+.field input:focus, .field select:focus, .field textarea:focus { border-color: rgb(47 155 255 / 0.7); box-shadow: 0 0 0 3px rgb(47 155 255 / 0.1); }
+
 .fiberops-rail::before {
   content: "";
   position: absolute;
