@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   departments,
@@ -90,4 +90,63 @@ export const demoRouter = router({
       await db.insert(operationalAuditLogs).values({ actorUserId: ctx.user.id, entityType: "demo_seed", entityId: 0, action: "create", summary: "تعبئة بيانات FiberOps التجريبية الأولى" });
       return { inserted: true, message: "تمت تعبئة البيانات التجريبية بنجاح. يمكنك تعديل أي سجل أو حذفه من الواجهة." };
     }),
+  repairArabic: systemAdminProcedure.mutation(async ({ ctx }) => {
+    const db = await requireDb();
+    const existing = await db.select({ id: employees.id }).from(employees).where(eq(employees.employeeNo, "DEMO-001")).limit(1);
+    if (existing.length === 0) {
+      return { repaired: false, message: "لا توجد بيانات تجريبية تحتاج إلى إصلاح." };
+    }
+
+    await db.execute(sql.raw("ALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"));
+    for (const table of ["users", "departments", "projects", "employees", "residencyPermits", "employeeQualifications", "employeeDocuments", "employeeAssignments", "fiberDrums", "fieldEquipment", "permits", "workRoutes", "operationalAuditLogs"]) {
+      await db.execute(sql.raw(`ALTER TABLE \`${table}\` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`));
+    }
+
+    await db.update(departments).set({ name: "التشغيل الميداني التجريبي", managerName: "مسؤول تشغيل تجريبي" }).where(eq(departments.code, "DEMO-FIELD"));
+    await db.update(departments).set({ name: "ضمان الجودة التجريبي", managerName: "مسؤول جودة تجريبي" }).where(eq(departments.code, "DEMO-QA"));
+    await db.update(projects).set({ name: "توسعة FTTH التجريبية — نطاق الرياض", clientName: "جهة اختبار" }).where(eq(projects.code, "DEMO-FTTH-RYD-01"));
+    await db.update(projects).set({ name: "ربط مناطق FTTH التجريبية — نطاق جدة", clientName: "جهة اختبار" }).where(eq(projects.code, "DEMO-FTTH-JED-02"));
+
+    const employeeRepairs = [
+      ["DEMO-001", "سامي", "تجريبي", "مشرف تمديد", "سعودي"],
+      ["DEMO-002", "نادر", "تجريبي", "فني لحام ألياف", "مصري"],
+      ["DEMO-003", "عمر", "تجريبي", "فني OTDR", "أردني"],
+      ["DEMO-004", "خالد", "تجريبي", "فني سحب كابلات", "هندي"],
+      ["DEMO-005", "ماهر", "تجريبي", "مراقب سلامة", "باكستاني"],
+      ["DEMO-006", "فهد", "تجريبي", "منسق تصاريح", "سعودي"],
+    ] as const;
+    for (const [employeeNo, firstName, lastName, jobTitle, nationality] of employeeRepairs) {
+      await db.update(employees).set({ firstName, lastName, jobTitle, nationality, emergencyContactName: "اتصال تجريبي", notes: "سجل تجريبي قابل للتعديل أو الحذف." }).where(eq(employees.employeeNo, employeeNo));
+    }
+
+    for (let index = 1; index <= 6; index += 1) {
+      await db.update(residencyPermits).set({ sponsorName: "راعي تجريبي", renewalNotes: "بيانات تجريبية" }).where(eq(residencyPermits.iqamaNumber, `DEMO-IQ-${String(index).padStart(3, "0")}`));
+      await db.update(employeeQualifications).set({ issuer: "معهد تدريبي تجريبي", notes: "مؤهل تجريبي" }).where(eq(employeeQualifications.certificateNumber, `DEMO-CERT-${index}`));
+    }
+    await db.update(employeeQualifications).set({ name: "سلامة مواقع الألياف" }).where(eq(employeeQualifications.certificateNumber, "DEMO-CERT-1"));
+    await db.update(employeeQualifications).set({ name: "Fiber Optic Splicing" }).where(eq(employeeQualifications.certificateNumber, "DEMO-CERT-2"));
+    await db.update(employeeQualifications).set({ name: "قياسات OTDR" }).where(eq(employeeQualifications.certificateNumber, "DEMO-CERT-3"));
+    await db.update(employeeQualifications).set({ name: "سلامة مواقع الألياف" }).where(eq(employeeQualifications.certificateNumber, "DEMO-CERT-4"));
+    await db.update(employeeQualifications).set({ name: "السلامة المهنية" }).where(eq(employeeQualifications.certificateNumber, "DEMO-CERT-5"));
+    await db.update(employeeQualifications).set({ name: "إدارة تصاريح الحفر" }).where(eq(employeeQualifications.certificateNumber, "DEMO-CERT-6"));
+    await db.update(employeeDocuments).set({ title: "عقد عمل تجريبي", notes: "وثيقة تجريبية" }).where(eq(employeeDocuments.referenceNumber, "DEMO-CON-001"));
+    await db.update(employeeDocuments).set({ title: "عقد عمل تجريبي", notes: "وثيقة تجريبية" }).where(eq(employeeDocuments.referenceNumber, "DEMO-CON-002"));
+    await db.update(employeeDocuments).set({ title: "تأمين طبي تجريبي", notes: "وثيقة تجريبية" }).where(eq(employeeDocuments.referenceNumber, "DEMO-INS-003"));
+    await db.update(employeeDocuments).set({ title: "هوية تجريبية", notes: "وثيقة تجريبية" }).where(eq(employeeDocuments.referenceNumber, "DEMO-ID-004"));
+    await db.update(employeeAssignments).set({ roleOnProject: "فني تنفيذ", notes: "تكليف تجريبي" }).where(eq(employeeAssignments.notes, "????"));
+    await db.update(fiberDrums).set({ supplier: "مورد تجريبي", storageLocation: "مستودع الرياض التجريبي" }).where(eq(fiberDrums.drumId, "DEMO-DRUM-001"));
+    await db.update(fiberDrums).set({ supplier: "مورد تجريبي", storageLocation: "مستودع الرياض التجريبي" }).where(eq(fiberDrums.drumId, "DEMO-DRUM-002"));
+    await db.update(fiberDrums).set({ supplier: "مورد تجريبي", storageLocation: "مستودع الموقع التجريبي" }).where(eq(fiberDrums.drumId, "DEMO-DRUM-003"));
+    await db.update(fieldEquipment).set({ name: "جهاز OTDR تجريبي" }).where(eq(fieldEquipment.assetTag, "DEMO-OTDR-001"));
+    await db.update(fieldEquipment).set({ name: "آلة لحام ألياف تجريبية" }).where(eq(fieldEquipment.assetTag, "DEMO-SP-001"));
+    await db.update(fieldEquipment).set({ name: "مقياس قدرة تجريبي" }).where(eq(fieldEquipment.assetTag, "DEMO-PM-001"));
+    await db.update(permits).set({ routeName: "مسار حي تجريبي — القطاع أ", notes: "تصريح تجريبي" }).where(eq(permits.permitNo, "DEMO-PERMIT-001"));
+    await db.update(permits).set({ routeName: "عبور تجريبي — القطاع ب", notes: "تصريح تجريبي" }).where(eq(permits.permitNo, "DEMO-PERMIT-002"));
+    await db.update(permits).set({ routeName: "امتداد تجريبي — القطاع ج", notes: "تصريح تجريبي" }).where(eq(permits.permitNo, "DEMO-PERMIT-003"));
+    await db.update(workRoutes).set({ name: "مسار تمديد تجريبي — القطاع أ", contractorName: "فريق اختبار" }).where(eq(workRoutes.routeCode, "DEMO-RT-001"));
+    await db.update(workRoutes).set({ name: "مسار عبور تجريبي — القطاع ب", contractorName: "فريق اختبار" }).where(eq(workRoutes.routeCode, "DEMO-RT-002"));
+    await db.update(workRoutes).set({ name: "مسار توسعة تجريبي — القطاع ج", contractorName: "فريق اختبار" }).where(eq(workRoutes.routeCode, "DEMO-RT-003"));
+    await db.insert(operationalAuditLogs).values({ actorUserId: ctx.user.id, entityType: "arabic_encoding", entityId: 0, action: "update", summary: "إصلاح ترميز البيانات العربية التجريبية" });
+    return { repaired: true, message: "تم إصلاح النص العربي في جميع البيانات التجريبية." };
+  }),
 });

@@ -16,6 +16,7 @@ import { z as z5 } from "zod";
 // server/db.ts
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
+import { createPool } from "mysql2/promise";
 
 // drizzle/schema.ts
 import {
@@ -266,7 +267,8 @@ var _db = null;
 async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
     try {
-      _db = drizzle(process.env.DATABASE_URL);
+      const pool = createPool({ uri: process.env.DATABASE_URL, charset: "utf8mb4", connectionLimit: 5 });
+      _db = drizzle({ client: pool });
     } catch (error) {
       console.warn("[Database] Failed to connect:", error);
       _db = null;
@@ -1086,6 +1088,7 @@ var usersRouter = router({
 });
 
 // server/routers/demo.ts
+import { eq as eq5, sql } from "drizzle-orm";
 import { z as z4 } from "zod";
 function insertedId(result) {
   const value = Array.isArray(result) ? result[0] : result;
@@ -1152,6 +1155,61 @@ var demoRouter = router({
     ]);
     await db.insert(operationalAuditLogs).values({ actorUserId: ctx.user.id, entityType: "demo_seed", entityId: 0, action: "create", summary: "\u062A\u0639\u0628\u0626\u0629 \u0628\u064A\u0627\u0646\u0627\u062A FiberOps \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A\u0629 \u0627\u0644\u0623\u0648\u0644\u0649" });
     return { inserted: true, message: "\u062A\u0645\u062A \u062A\u0639\u0628\u0626\u0629 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A\u0629 \u0628\u0646\u062C\u0627\u062D. \u064A\u0645\u0643\u0646\u0643 \u062A\u0639\u062F\u064A\u0644 \u0623\u064A \u0633\u062C\u0644 \u0623\u0648 \u062D\u0630\u0641\u0647 \u0645\u0646 \u0627\u0644\u0648\u0627\u062C\u0647\u0629." };
+  }),
+  repairArabic: systemAdminProcedure.mutation(async ({ ctx }) => {
+    const db = await requireDb();
+    const existing = await db.select({ id: employees.id }).from(employees).where(eq5(employees.employeeNo, "DEMO-001")).limit(1);
+    if (existing.length === 0) {
+      return { repaired: false, message: "\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A \u062A\u062C\u0631\u064A\u0628\u064A\u0629 \u062A\u062D\u062A\u0627\u062C \u0625\u0644\u0649 \u0625\u0635\u0644\u0627\u062D." };
+    }
+    await db.execute(sql.raw("ALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"));
+    for (const table of ["users", "departments", "projects", "employees", "residencyPermits", "employeeQualifications", "employeeDocuments", "employeeAssignments", "fiberDrums", "fieldEquipment", "permits", "workRoutes", "operationalAuditLogs"]) {
+      await db.execute(sql.raw(`ALTER TABLE \`${table}\` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`));
+    }
+    await db.update(departments).set({ name: "\u0627\u0644\u062A\u0634\u063A\u064A\u0644 \u0627\u0644\u0645\u064A\u062F\u0627\u0646\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A", managerName: "\u0645\u0633\u0624\u0648\u0644 \u062A\u0634\u063A\u064A\u0644 \u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(departments.code, "DEMO-FIELD"));
+    await db.update(departments).set({ name: "\u0636\u0645\u0627\u0646 \u0627\u0644\u062C\u0648\u062F\u0629 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A", managerName: "\u0645\u0633\u0624\u0648\u0644 \u062C\u0648\u062F\u0629 \u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(departments.code, "DEMO-QA"));
+    await db.update(projects).set({ name: "\u062A\u0648\u0633\u0639\u0629 FTTH \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A\u0629 \u2014 \u0646\u0637\u0627\u0642 \u0627\u0644\u0631\u064A\u0627\u0636", clientName: "\u062C\u0647\u0629 \u0627\u062E\u062A\u0628\u0627\u0631" }).where(eq5(projects.code, "DEMO-FTTH-RYD-01"));
+    await db.update(projects).set({ name: "\u0631\u0628\u0637 \u0645\u0646\u0627\u0637\u0642 FTTH \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A\u0629 \u2014 \u0646\u0637\u0627\u0642 \u062C\u062F\u0629", clientName: "\u062C\u0647\u0629 \u0627\u062E\u062A\u0628\u0627\u0631" }).where(eq5(projects.code, "DEMO-FTTH-JED-02"));
+    const employeeRepairs = [
+      ["DEMO-001", "\u0633\u0627\u0645\u064A", "\u062A\u062C\u0631\u064A\u0628\u064A", "\u0645\u0634\u0631\u0641 \u062A\u0645\u062F\u064A\u062F", "\u0633\u0639\u0648\u062F\u064A"],
+      ["DEMO-002", "\u0646\u0627\u062F\u0631", "\u062A\u062C\u0631\u064A\u0628\u064A", "\u0641\u0646\u064A \u0644\u062D\u0627\u0645 \u0623\u0644\u064A\u0627\u0641", "\u0645\u0635\u0631\u064A"],
+      ["DEMO-003", "\u0639\u0645\u0631", "\u062A\u062C\u0631\u064A\u0628\u064A", "\u0641\u0646\u064A OTDR", "\u0623\u0631\u062F\u0646\u064A"],
+      ["DEMO-004", "\u062E\u0627\u0644\u062F", "\u062A\u062C\u0631\u064A\u0628\u064A", "\u0641\u0646\u064A \u0633\u062D\u0628 \u0643\u0627\u0628\u0644\u0627\u062A", "\u0647\u0646\u062F\u064A"],
+      ["DEMO-005", "\u0645\u0627\u0647\u0631", "\u062A\u062C\u0631\u064A\u0628\u064A", "\u0645\u0631\u0627\u0642\u0628 \u0633\u0644\u0627\u0645\u0629", "\u0628\u0627\u0643\u0633\u062A\u0627\u0646\u064A"],
+      ["DEMO-006", "\u0641\u0647\u062F", "\u062A\u062C\u0631\u064A\u0628\u064A", "\u0645\u0646\u0633\u0642 \u062A\u0635\u0627\u0631\u064A\u062D", "\u0633\u0639\u0648\u062F\u064A"]
+    ];
+    for (const [employeeNo, firstName, lastName, jobTitle, nationality] of employeeRepairs) {
+      await db.update(employees).set({ firstName, lastName, jobTitle, nationality, emergencyContactName: "\u0627\u062A\u0635\u0627\u0644 \u062A\u062C\u0631\u064A\u0628\u064A", notes: "\u0633\u062C\u0644 \u062A\u062C\u0631\u064A\u0628\u064A \u0642\u0627\u0628\u0644 \u0644\u0644\u062A\u0639\u062F\u064A\u0644 \u0623\u0648 \u0627\u0644\u062D\u0630\u0641." }).where(eq5(employees.employeeNo, employeeNo));
+    }
+    for (let index2 = 1; index2 <= 6; index2 += 1) {
+      await db.update(residencyPermits).set({ sponsorName: "\u0631\u0627\u0639\u064A \u062A\u062C\u0631\u064A\u0628\u064A", renewalNotes: "\u0628\u064A\u0627\u0646\u0627\u062A \u062A\u062C\u0631\u064A\u0628\u064A\u0629" }).where(eq5(residencyPermits.iqamaNumber, `DEMO-IQ-${String(index2).padStart(3, "0")}`));
+      await db.update(employeeQualifications).set({ issuer: "\u0645\u0639\u0647\u062F \u062A\u062F\u0631\u064A\u0628\u064A \u062A\u062C\u0631\u064A\u0628\u064A", notes: "\u0645\u0624\u0647\u0644 \u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(employeeQualifications.certificateNumber, `DEMO-CERT-${index2}`));
+    }
+    await db.update(employeeQualifications).set({ name: "\u0633\u0644\u0627\u0645\u0629 \u0645\u0648\u0627\u0642\u0639 \u0627\u0644\u0623\u0644\u064A\u0627\u0641" }).where(eq5(employeeQualifications.certificateNumber, "DEMO-CERT-1"));
+    await db.update(employeeQualifications).set({ name: "Fiber Optic Splicing" }).where(eq5(employeeQualifications.certificateNumber, "DEMO-CERT-2"));
+    await db.update(employeeQualifications).set({ name: "\u0642\u064A\u0627\u0633\u0627\u062A OTDR" }).where(eq5(employeeQualifications.certificateNumber, "DEMO-CERT-3"));
+    await db.update(employeeQualifications).set({ name: "\u0633\u0644\u0627\u0645\u0629 \u0645\u0648\u0627\u0642\u0639 \u0627\u0644\u0623\u0644\u064A\u0627\u0641" }).where(eq5(employeeQualifications.certificateNumber, "DEMO-CERT-4"));
+    await db.update(employeeQualifications).set({ name: "\u0627\u0644\u0633\u0644\u0627\u0645\u0629 \u0627\u0644\u0645\u0647\u0646\u064A\u0629" }).where(eq5(employeeQualifications.certificateNumber, "DEMO-CERT-5"));
+    await db.update(employeeQualifications).set({ name: "\u0625\u062F\u0627\u0631\u0629 \u062A\u0635\u0627\u0631\u064A\u062D \u0627\u0644\u062D\u0641\u0631" }).where(eq5(employeeQualifications.certificateNumber, "DEMO-CERT-6"));
+    await db.update(employeeDocuments).set({ title: "\u0639\u0642\u062F \u0639\u0645\u0644 \u062A\u062C\u0631\u064A\u0628\u064A", notes: "\u0648\u062B\u064A\u0642\u0629 \u062A\u062C\u0631\u064A\u0628\u064A\u0629" }).where(eq5(employeeDocuments.referenceNumber, "DEMO-CON-001"));
+    await db.update(employeeDocuments).set({ title: "\u0639\u0642\u062F \u0639\u0645\u0644 \u062A\u062C\u0631\u064A\u0628\u064A", notes: "\u0648\u062B\u064A\u0642\u0629 \u062A\u062C\u0631\u064A\u0628\u064A\u0629" }).where(eq5(employeeDocuments.referenceNumber, "DEMO-CON-002"));
+    await db.update(employeeDocuments).set({ title: "\u062A\u0623\u0645\u064A\u0646 \u0637\u0628\u064A \u062A\u062C\u0631\u064A\u0628\u064A", notes: "\u0648\u062B\u064A\u0642\u0629 \u062A\u062C\u0631\u064A\u0628\u064A\u0629" }).where(eq5(employeeDocuments.referenceNumber, "DEMO-INS-003"));
+    await db.update(employeeDocuments).set({ title: "\u0647\u0648\u064A\u0629 \u062A\u062C\u0631\u064A\u0628\u064A\u0629", notes: "\u0648\u062B\u064A\u0642\u0629 \u062A\u062C\u0631\u064A\u0628\u064A\u0629" }).where(eq5(employeeDocuments.referenceNumber, "DEMO-ID-004"));
+    await db.update(employeeAssignments).set({ roleOnProject: "\u0641\u0646\u064A \u062A\u0646\u0641\u064A\u0630", notes: "\u062A\u0643\u0644\u064A\u0641 \u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(employeeAssignments.notes, "????"));
+    await db.update(fiberDrums).set({ supplier: "\u0645\u0648\u0631\u062F \u062A\u062C\u0631\u064A\u0628\u064A", storageLocation: "\u0645\u0633\u062A\u0648\u062F\u0639 \u0627\u0644\u0631\u064A\u0627\u0636 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(fiberDrums.drumId, "DEMO-DRUM-001"));
+    await db.update(fiberDrums).set({ supplier: "\u0645\u0648\u0631\u062F \u062A\u062C\u0631\u064A\u0628\u064A", storageLocation: "\u0645\u0633\u062A\u0648\u062F\u0639 \u0627\u0644\u0631\u064A\u0627\u0636 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(fiberDrums.drumId, "DEMO-DRUM-002"));
+    await db.update(fiberDrums).set({ supplier: "\u0645\u0648\u0631\u062F \u062A\u062C\u0631\u064A\u0628\u064A", storageLocation: "\u0645\u0633\u062A\u0648\u062F\u0639 \u0627\u0644\u0645\u0648\u0642\u0639 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(fiberDrums.drumId, "DEMO-DRUM-003"));
+    await db.update(fieldEquipment).set({ name: "\u062C\u0647\u0627\u0632 OTDR \u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(fieldEquipment.assetTag, "DEMO-OTDR-001"));
+    await db.update(fieldEquipment).set({ name: "\u0622\u0644\u0629 \u0644\u062D\u0627\u0645 \u0623\u0644\u064A\u0627\u0641 \u062A\u062C\u0631\u064A\u0628\u064A\u0629" }).where(eq5(fieldEquipment.assetTag, "DEMO-SP-001"));
+    await db.update(fieldEquipment).set({ name: "\u0645\u0642\u064A\u0627\u0633 \u0642\u062F\u0631\u0629 \u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(fieldEquipment.assetTag, "DEMO-PM-001"));
+    await db.update(permits).set({ routeName: "\u0645\u0633\u0627\u0631 \u062D\u064A \u062A\u062C\u0631\u064A\u0628\u064A \u2014 \u0627\u0644\u0642\u0637\u0627\u0639 \u0623", notes: "\u062A\u0635\u0631\u064A\u062D \u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(permits.permitNo, "DEMO-PERMIT-001"));
+    await db.update(permits).set({ routeName: "\u0639\u0628\u0648\u0631 \u062A\u062C\u0631\u064A\u0628\u064A \u2014 \u0627\u0644\u0642\u0637\u0627\u0639 \u0628", notes: "\u062A\u0635\u0631\u064A\u062D \u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(permits.permitNo, "DEMO-PERMIT-002"));
+    await db.update(permits).set({ routeName: "\u0627\u0645\u062A\u062F\u0627\u062F \u062A\u062C\u0631\u064A\u0628\u064A \u2014 \u0627\u0644\u0642\u0637\u0627\u0639 \u062C", notes: "\u062A\u0635\u0631\u064A\u062D \u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(permits.permitNo, "DEMO-PERMIT-003"));
+    await db.update(workRoutes).set({ name: "\u0645\u0633\u0627\u0631 \u062A\u0645\u062F\u064A\u062F \u062A\u062C\u0631\u064A\u0628\u064A \u2014 \u0627\u0644\u0642\u0637\u0627\u0639 \u0623", contractorName: "\u0641\u0631\u064A\u0642 \u0627\u062E\u062A\u0628\u0627\u0631" }).where(eq5(workRoutes.routeCode, "DEMO-RT-001"));
+    await db.update(workRoutes).set({ name: "\u0645\u0633\u0627\u0631 \u0639\u0628\u0648\u0631 \u062A\u062C\u0631\u064A\u0628\u064A \u2014 \u0627\u0644\u0642\u0637\u0627\u0639 \u0628", contractorName: "\u0641\u0631\u064A\u0642 \u0627\u062E\u062A\u0628\u0627\u0631" }).where(eq5(workRoutes.routeCode, "DEMO-RT-002"));
+    await db.update(workRoutes).set({ name: "\u0645\u0633\u0627\u0631 \u062A\u0648\u0633\u0639\u0629 \u062A\u062C\u0631\u064A\u0628\u064A \u2014 \u0627\u0644\u0642\u0637\u0627\u0639 \u062C", contractorName: "\u0641\u0631\u064A\u0642 \u0627\u062E\u062A\u0628\u0627\u0631" }).where(eq5(workRoutes.routeCode, "DEMO-RT-003"));
+    await db.insert(operationalAuditLogs).values({ actorUserId: ctx.user.id, entityType: "arabic_encoding", entityId: 0, action: "update", summary: "\u0625\u0635\u0644\u0627\u062D \u062A\u0631\u0645\u064A\u0632 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u0639\u0631\u0628\u064A\u0629 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A\u0629" });
+    return { repaired: true, message: "\u062A\u0645 \u0625\u0635\u0644\u0627\u062D \u0627\u0644\u0646\u0635 \u0627\u0644\u0639\u0631\u0628\u064A \u0641\u064A \u062C\u0645\u064A\u0639 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A\u0629." };
   })
 });
 

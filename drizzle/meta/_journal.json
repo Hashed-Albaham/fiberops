@@ -15,6 +15,13 @@
       "when": 1786990475584,
       "tag": "0001_oval_xorn",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1786992280000,
+      "tag": "0002_utf8mb4_arabic",
+      "breakpoints": true
     }
   ]
 }

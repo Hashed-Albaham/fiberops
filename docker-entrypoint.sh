@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-if [ "${RUN_MIGRATIONS:-true}" = "true" ]; then
+if [ "${RUN_MIGRATIONS:-false}" = "true" ]; then
   echo "[FiberOps] Waiting for the MySQL database..."
   node --input-type=module -e '
     import mysql from "mysql2/promise";

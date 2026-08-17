@@ -50,6 +50,14 @@ export default function UserManagement() {
     },
     onError: error => toast.error(error.message || "تعذر تعبئة البيانات التجريبية."),
   });
+  const repairArabic = trpc.demo.repairArabic.useMutation({
+    onSuccess: async result => {
+      if (result.repaired) toast.success(result.message);
+      else toast.message(result.message);
+      await Promise.all([utils.workforce.invalidate(), utils.operations.invalidate(), utils.demo.status.invalidate()]);
+    },
+    onError: error => toast.error(error.message || "تعذر إصلاح النص العربي."),
+  });
 
   const roleSummary = useMemo(() => {
     const rows = usersQuery.data ?? [];
@@ -64,7 +72,7 @@ export default function UserManagement() {
   return <div dir="rtl" className="mx-auto max-w-[1380px] space-y-6 pb-10">
     <section className="flex flex-col gap-4 rounded-3xl border border-[#2F9BFF]/20 bg-[radial-gradient(circle_at_85%_10%,rgba(47,155,255,0.16),transparent_38%)] bg-[#0b1723] p-6 sm:flex-row sm:items-end sm:justify-between">
       <div><span className="inline-flex items-center gap-2 rounded-full border border-[#2F9BFF]/20 bg-[#2F9BFF]/10 px-3 py-1 text-[11px] font-bold tracking-[0.14em] text-[#9fd4ff]"><ShieldCheck size={14} />التحكم في الوصول</span><h1 className="mt-4 text-3xl font-bold text-white">المستخدمون والصلاحيات</h1><p className="mt-2 max-w-2xl text-sm leading-7 text-slate-400">أنشئ حسابات فريقك وحدد نطاق العمل المناسب لكل مستخدم. تبقى كل عملية تغيير موثقة في السجل التشغيلي.</p></div>
-      <div className="flex flex-wrap items-center gap-3"><button type="button" onClick={() => setDemoDialogOpen(true)} disabled={demoStatus.data?.populated || seedDemo.isPending} className="inline-flex h-11 items-center gap-2 rounded-xl border border-[#2F9BFF]/25 bg-[#2F9BFF]/10 px-4 text-sm font-bold text-[#9fd4ff] transition hover:bg-[#2F9BFF]/20 disabled:cursor-not-allowed disabled:opacity-50"><DatabaseZap size={17} />{seedDemo.isPending ? "جارٍ التعبئة…" : demoStatus.data?.populated ? "البيانات موجودة" : "تعبئة بيانات تجريبية"}</button><div className="rounded-2xl border border-white/[0.08] bg-[#07111a]/75 px-5 py-3"><span className="block text-xs text-slate-500">الحسابات النشطة</span><strong className="mt-1 block font-mono text-2xl text-white">{(usersQuery.data ?? []).filter(row => row.active === "yes").length}</strong></div></div>
+      <div className="flex flex-wrap items-center gap-3"><button type="button" onClick={() => setDemoDialogOpen(true)} disabled={demoStatus.data?.populated || seedDemo.isPending} className="inline-flex h-11 items-center gap-2 rounded-xl border border-[#2F9BFF]/25 bg-[#2F9BFF]/10 px-4 text-sm font-bold text-[#9fd4ff] transition hover:bg-[#2F9BFF]/20 disabled:cursor-not-allowed disabled:opacity-50"><DatabaseZap size={17} />{seedDemo.isPending ? "جارٍ التعبئة…" : demoStatus.data?.populated ? "البيانات موجودة" : "تعبئة بيانات تجريبية"}</button><button type="button" onClick={() => repairArabic.mutate()} disabled={!demoStatus.data?.populated || repairArabic.isPending} className="inline-flex h-11 items-center gap-2 rounded-xl border border-amber-300/25 bg-amber-300/10 px-4 text-sm font-bold text-amber-100 transition hover:bg-amber-300/20 disabled:cursor-not-allowed disabled:opacity-50"><DatabaseZap size={17} />{repairArabic.isPending ? "جارٍ إصلاح العربية…" : "إصلاح النص العربي"}</button><div className="rounded-2xl border border-white/[0.08] bg-[#07111a]/75 px-5 py-3"><span className="block text-xs text-slate-500">الحسابات النشطة</span><strong className="mt-1 block font-mono text-2xl text-white">{(usersQuery.data ?? []).filter(row => row.active === "yes").length}</strong></div></div>
     </section>
 
     <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">{roleSummary.map(role => <article key={role.value} className="rounded-2xl border border-white/[0.07] bg-[#101a25] p-4"><p className="text-xs font-semibold text-[#9fd4ff]">{role.label}</p><strong className="mt-3 block font-mono text-3xl text-white">{role.count}</strong><p className="mt-2 text-[11px] leading-5 text-slate-500">{role.note}</p></article>)}</section>
