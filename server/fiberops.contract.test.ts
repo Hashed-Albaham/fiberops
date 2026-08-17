@@ -38,7 +38,7 @@ describe("FiberOps operational contracts", () => {
   it("exposes the required protected business actions", () => {
     const workforceProcedures = Object.keys(workforceRouter._def.procedures);
     const operationsProcedures = Object.keys(operationsRouter._def.procedures);
-    expect(workforceProcedures).toEqual(expect.arrayContaining(["list", "createEmployee", "updateEmployee", "deleteEmployee", "renewResidency", "createQualification", "createDocument", "assignEmployee"]));
+    expect(workforceProcedures).toEqual(expect.arrayContaining(["list", "createEmployee", "updateEmployee", "deleteEmployee", "renewResidency", "createQualification", "updateQualification", "createDocument", "updateDocument", "assignEmployee", "updateAssignment"]));
     expect(operationsProcedures).toEqual(expect.arrayContaining(["list", "createDrum", "updateDrum", "createEquipment", "assignEquipment", "createPermit", "renewPermit", "createRoute"]));
   });
 });
