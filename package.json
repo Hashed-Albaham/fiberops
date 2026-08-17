@@ -1,6 +1,9 @@
 {
   "name": "requirements-site",
   "version": "1.0.0",
+  "engines": {
+    "node": "22.x"
+  },
   "type": "module",
   "license": "MIT",
   "scripts": {
