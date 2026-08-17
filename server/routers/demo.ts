@@ -92,8 +92,8 @@ export const demoRouter = router({
     }),
   repairArabic: systemAdminProcedure.mutation(async ({ ctx }) => {
     const db = await requireDb();
-    const existing = await db.select({ id: employees.id }).from(employees).where(eq(employees.employeeNo, "DEMO-001")).limit(1);
-    if (existing.length === 0) {
+    const demoEmployees = await db.select({ id: employees.id, employeeNo: employees.employeeNo }).from(employees).where(sql`${employees.employeeNo} LIKE 'DEMO-%'`);
+    if (demoEmployees.length === 0) {
       return { repaired: false, message: "لا توجد بيانات تجريبية تحتاج إلى إصلاح." };
     }
 
@@ -129,11 +129,29 @@ export const demoRouter = router({
     await db.update(employeeQualifications).set({ name: "سلامة مواقع الألياف" }).where(eq(employeeQualifications.certificateNumber, "DEMO-CERT-4"));
     await db.update(employeeQualifications).set({ name: "السلامة المهنية" }).where(eq(employeeQualifications.certificateNumber, "DEMO-CERT-5"));
     await db.update(employeeQualifications).set({ name: "إدارة تصاريح الحفر" }).where(eq(employeeQualifications.certificateNumber, "DEMO-CERT-6"));
-    await db.update(employeeDocuments).set({ title: "عقد عمل تجريبي", notes: "وثيقة تجريبية" }).where(eq(employeeDocuments.referenceNumber, "DEMO-CON-001"));
-    await db.update(employeeDocuments).set({ title: "عقد عمل تجريبي", notes: "وثيقة تجريبية" }).where(eq(employeeDocuments.referenceNumber, "DEMO-CON-002"));
-    await db.update(employeeDocuments).set({ title: "تأمين طبي تجريبي", notes: "وثيقة تجريبية" }).where(eq(employeeDocuments.referenceNumber, "DEMO-INS-003"));
-    await db.update(employeeDocuments).set({ title: "هوية تجريبية", notes: "وثيقة تجريبية" }).where(eq(employeeDocuments.referenceNumber, "DEMO-ID-004"));
-    await db.update(employeeAssignments).set({ roleOnProject: "فني تنفيذ", notes: "تكليف تجريبي" }).where(eq(employeeAssignments.notes, "????"));
+    const documentTitles: Record<string, string> = {
+      "DEMO-001": "عقد عمل تجريبي",
+      "DEMO-002": "عقد عمل تجريبي",
+      "DEMO-003": "تأمين طبي تجريبي",
+      "DEMO-004": "هوية تجريبية",
+    };
+    const assignmentRoles: Record<string, string> = {
+      "DEMO-001": "مشرف فريق",
+      "DEMO-002": "فني تنفيذ",
+      "DEMO-003": "فني تنفيذ",
+      "DEMO-004": "فني تنفيذ",
+      "DEMO-005": "مراقب سلامة",
+    };
+    for (const employee of demoEmployees) {
+      const documentTitle = documentTitles[employee.employeeNo];
+      if (documentTitle) {
+        await db.update(employeeDocuments).set({ title: documentTitle, notes: "وثيقة تجريبية" }).where(eq(employeeDocuments.employeeId, employee.id));
+      }
+      const assignmentRole = assignmentRoles[employee.employeeNo];
+      if (assignmentRole) {
+        await db.update(employeeAssignments).set({ roleOnProject: assignmentRole, notes: "تكليف تجريبي" }).where(eq(employeeAssignments.employeeId, employee.id));
+      }
+    }
     await db.update(fiberDrums).set({ supplier: "مورد تجريبي", storageLocation: "مستودع الرياض التجريبي" }).where(eq(fiberDrums.drumId, "DEMO-DRUM-001"));
     await db.update(fiberDrums).set({ supplier: "مورد تجريبي", storageLocation: "مستودع الرياض التجريبي" }).where(eq(fiberDrums.drumId, "DEMO-DRUM-002"));
     await db.update(fiberDrums).set({ supplier: "مورد تجريبي", storageLocation: "مستودع الموقع التجريبي" }).where(eq(fiberDrums.drumId, "DEMO-DRUM-003"));

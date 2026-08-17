@@ -1158,8 +1158,8 @@ var demoRouter = router({
   }),
   repairArabic: systemAdminProcedure.mutation(async ({ ctx }) => {
     const db = await requireDb();
-    const existing = await db.select({ id: employees.id }).from(employees).where(eq5(employees.employeeNo, "DEMO-001")).limit(1);
-    if (existing.length === 0) {
+    const demoEmployees = await db.select({ id: employees.id, employeeNo: employees.employeeNo }).from(employees).where(sql`${employees.employeeNo} LIKE 'DEMO-%'`);
+    if (demoEmployees.length === 0) {
       return { repaired: false, message: "\u0644\u0627 \u062A\u0648\u062C\u062F \u0628\u064A\u0627\u0646\u0627\u062A \u062A\u062C\u0631\u064A\u0628\u064A\u0629 \u062A\u062D\u062A\u0627\u062C \u0625\u0644\u0649 \u0625\u0635\u0644\u0627\u062D." };
     }
     await db.execute(sql.raw("ALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"));
@@ -1191,11 +1191,29 @@ var demoRouter = router({
     await db.update(employeeQualifications).set({ name: "\u0633\u0644\u0627\u0645\u0629 \u0645\u0648\u0627\u0642\u0639 \u0627\u0644\u0623\u0644\u064A\u0627\u0641" }).where(eq5(employeeQualifications.certificateNumber, "DEMO-CERT-4"));
     await db.update(employeeQualifications).set({ name: "\u0627\u0644\u0633\u0644\u0627\u0645\u0629 \u0627\u0644\u0645\u0647\u0646\u064A\u0629" }).where(eq5(employeeQualifications.certificateNumber, "DEMO-CERT-5"));
     await db.update(employeeQualifications).set({ name: "\u0625\u062F\u0627\u0631\u0629 \u062A\u0635\u0627\u0631\u064A\u062D \u0627\u0644\u062D\u0641\u0631" }).where(eq5(employeeQualifications.certificateNumber, "DEMO-CERT-6"));
-    await db.update(employeeDocuments).set({ title: "\u0639\u0642\u062F \u0639\u0645\u0644 \u062A\u062C\u0631\u064A\u0628\u064A", notes: "\u0648\u062B\u064A\u0642\u0629 \u062A\u062C\u0631\u064A\u0628\u064A\u0629" }).where(eq5(employeeDocuments.referenceNumber, "DEMO-CON-001"));
-    await db.update(employeeDocuments).set({ title: "\u0639\u0642\u062F \u0639\u0645\u0644 \u062A\u062C\u0631\u064A\u0628\u064A", notes: "\u0648\u062B\u064A\u0642\u0629 \u062A\u062C\u0631\u064A\u0628\u064A\u0629" }).where(eq5(employeeDocuments.referenceNumber, "DEMO-CON-002"));
-    await db.update(employeeDocuments).set({ title: "\u062A\u0623\u0645\u064A\u0646 \u0637\u0628\u064A \u062A\u062C\u0631\u064A\u0628\u064A", notes: "\u0648\u062B\u064A\u0642\u0629 \u062A\u062C\u0631\u064A\u0628\u064A\u0629" }).where(eq5(employeeDocuments.referenceNumber, "DEMO-INS-003"));
-    await db.update(employeeDocuments).set({ title: "\u0647\u0648\u064A\u0629 \u062A\u062C\u0631\u064A\u0628\u064A\u0629", notes: "\u0648\u062B\u064A\u0642\u0629 \u062A\u062C\u0631\u064A\u0628\u064A\u0629" }).where(eq5(employeeDocuments.referenceNumber, "DEMO-ID-004"));
-    await db.update(employeeAssignments).set({ roleOnProject: "\u0641\u0646\u064A \u062A\u0646\u0641\u064A\u0630", notes: "\u062A\u0643\u0644\u064A\u0641 \u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(employeeAssignments.notes, "????"));
+    const documentTitles = {
+      "DEMO-001": "\u0639\u0642\u062F \u0639\u0645\u0644 \u062A\u062C\u0631\u064A\u0628\u064A",
+      "DEMO-002": "\u0639\u0642\u062F \u0639\u0645\u0644 \u062A\u062C\u0631\u064A\u0628\u064A",
+      "DEMO-003": "\u062A\u0623\u0645\u064A\u0646 \u0637\u0628\u064A \u062A\u062C\u0631\u064A\u0628\u064A",
+      "DEMO-004": "\u0647\u0648\u064A\u0629 \u062A\u062C\u0631\u064A\u0628\u064A\u0629"
+    };
+    const assignmentRoles = {
+      "DEMO-001": "\u0645\u0634\u0631\u0641 \u0641\u0631\u064A\u0642",
+      "DEMO-002": "\u0641\u0646\u064A \u062A\u0646\u0641\u064A\u0630",
+      "DEMO-003": "\u0641\u0646\u064A \u062A\u0646\u0641\u064A\u0630",
+      "DEMO-004": "\u0641\u0646\u064A \u062A\u0646\u0641\u064A\u0630",
+      "DEMO-005": "\u0645\u0631\u0627\u0642\u0628 \u0633\u0644\u0627\u0645\u0629"
+    };
+    for (const employee of demoEmployees) {
+      const documentTitle = documentTitles[employee.employeeNo];
+      if (documentTitle) {
+        await db.update(employeeDocuments).set({ title: documentTitle, notes: "\u0648\u062B\u064A\u0642\u0629 \u062A\u062C\u0631\u064A\u0628\u064A\u0629" }).where(eq5(employeeDocuments.employeeId, employee.id));
+      }
+      const assignmentRole = assignmentRoles[employee.employeeNo];
+      if (assignmentRole) {
+        await db.update(employeeAssignments).set({ roleOnProject: assignmentRole, notes: "\u062A\u0643\u0644\u064A\u0641 \u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(employeeAssignments.employeeId, employee.id));
+      }
+    }
     await db.update(fiberDrums).set({ supplier: "\u0645\u0648\u0631\u062F \u062A\u062C\u0631\u064A\u0628\u064A", storageLocation: "\u0645\u0633\u062A\u0648\u062F\u0639 \u0627\u0644\u0631\u064A\u0627\u0636 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(fiberDrums.drumId, "DEMO-DRUM-001"));
     await db.update(fiberDrums).set({ supplier: "\u0645\u0648\u0631\u062F \u062A\u062C\u0631\u064A\u0628\u064A", storageLocation: "\u0645\u0633\u062A\u0648\u062F\u0639 \u0627\u0644\u0631\u064A\u0627\u0636 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(fiberDrums.drumId, "DEMO-DRUM-002"));
     await db.update(fiberDrums).set({ supplier: "\u0645\u0648\u0631\u062F \u062A\u062C\u0631\u064A\u0628\u064A", storageLocation: "\u0645\u0633\u062A\u0648\u062F\u0639 \u0627\u0644\u0645\u0648\u0642\u0639 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A" }).where(eq5(fiberDrums.drumId, "DEMO-DRUM-003"));
