@@ -1,0 +1,1699 @@
+// server/app.ts
+import express2 from "express";
+import { createExpressMiddleware } from "@trpc/server/adapters/express";
+
+// shared/const.ts
+var COOKIE_NAME = "app_session_id";
+var ONE_YEAR_MS = 1e3 * 60 * 60 * 24 * 365;
+var AXIOS_TIMEOUT_MS = 3e4;
+var UNAUTHED_ERR_MSG = "Please login (10001)";
+var NOT_ADMIN_ERR_MSG = "You do not have required permission (10002)";
+var OAUTH_STATE_COOKIE = "__Host-oauth_state";
+var decodeOAuthState = (state) => {
+  let decoded;
+  try {
+    decoded = atob(state);
+  } catch {
+    return { redirectUri: "" };
+  }
+  try {
+    const parsed = JSON.parse(decoded);
+    if (parsed && typeof parsed.redirectUri === "string") return parsed;
+  } catch {
+  }
+  return { redirectUri: decoded };
+};
+
+// server/_core/oauth.ts
+import { parse as parseCookieHeader2 } from "cookie";
+
+// server/db.ts
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/mysql2";
+
+// drizzle/schema.ts
+import {
+  date,
+  index,
+  int,
+  mysqlEnum,
+  mysqlTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  varchar
+} from "drizzle-orm/mysql-core";
+var users = mysqlTable("users", {
+  id: int("id").autoincrement().primaryKey(),
+  openId: varchar("openId", { length: 64 }).notNull().unique(),
+  name: text("name"),
+  email: varchar("email", { length: 320 }),
+  loginMethod: varchar("loginMethod", { length: 64 }),
+  role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull()
+});
+var departments = mysqlTable(
+  "departments",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    name: varchar("name", { length: 120 }).notNull(),
+    code: varchar("code", { length: 32 }).notNull(),
+    managerName: varchar("managerName", { length: 160 }),
+    active: mysqlEnum("active", ["yes", "no"]).default("yes").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [uniqueIndex("departments_code_unique").on(table.code)]
+);
+var projects = mysqlTable(
+  "projects",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    code: varchar("code", { length: 40 }).notNull(),
+    name: varchar("name", { length: 180 }).notNull(),
+    clientName: varchar("clientName", { length: 180 }),
+    status: mysqlEnum("status", ["planning", "active", "paused", "completed"]).default("planning").notNull(),
+    startDate: date("startDate"),
+    targetDate: date("targetDate"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [uniqueIndex("projects_code_unique").on(table.code), index("projects_status_idx").on(table.status)]
+);
+var employees = mysqlTable(
+  "employees",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    employeeNo: varchar("employeeNo", { length: 40 }).notNull(),
+    firstName: varchar("firstName", { length: 100 }).notNull(),
+    lastName: varchar("lastName", { length: 100 }).notNull(),
+    jobTitle: varchar("jobTitle", { length: 150 }).notNull(),
+    nationality: varchar("nationality", { length: 90 }).notNull(),
+    phone: varchar("phone", { length: 32 }),
+    email: varchar("email", { length: 320 }),
+    passportNumber: varchar("passportNumber", { length: 64 }),
+    passportExpiryAt: date("passportExpiryAt"),
+    joiningDate: date("joiningDate").notNull(),
+    employmentStatus: mysqlEnum("employmentStatus", ["active", "on_leave", "suspended", "terminated"]).default("active").notNull(),
+    departmentId: int("departmentId").references(() => departments.id, { onDelete: "set null" }),
+    primaryProjectId: int("primaryProjectId").references(() => projects.id, { onDelete: "set null" }),
+    emergencyContactName: varchar("emergencyContactName", { length: 160 }),
+    emergencyContactPhone: varchar("emergencyContactPhone", { length: 32 }),
+    notes: text("notes"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("employees_employee_no_unique").on(table.employeeNo),
+    index("employees_status_idx").on(table.employmentStatus),
+    index("employees_department_idx").on(table.departmentId),
+    index("employees_project_idx").on(table.primaryProjectId)
+  ]
+);
+var residencyPermits = mysqlTable(
+  "residencyPermits",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    employeeId: int("employeeId").notNull().references(() => employees.id, { onDelete: "cascade" }),
+    iqamaNumber: varchar("iqamaNumber", { length: 64 }).notNull(),
+    sponsorName: varchar("sponsorName", { length: 180 }),
+    issueDate: date("issueDate"),
+    expiryDate: date("expiryDate").notNull(),
+    status: mysqlEnum("status", ["valid", "expiring", "expired", "under_renewal"]).default("valid").notNull(),
+    lastRenewedAt: timestamp("lastRenewedAt"),
+    renewalReference: varchar("renewalReference", { length: 80 }),
+    renewalNotes: text("renewalNotes"),
+    attachmentKey: varchar("attachmentKey", { length: 512 }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [
+    uniqueIndex("residency_iqama_unique").on(table.iqamaNumber),
+    uniqueIndex("residency_employee_unique").on(table.employeeId),
+    index("residency_status_expiry_idx").on(table.status, table.expiryDate)
+  ]
+);
+var employeeQualifications = mysqlTable(
+  "employeeQualifications",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    employeeId: int("employeeId").notNull().references(() => employees.id, { onDelete: "cascade" }),
+    name: varchar("name", { length: 180 }).notNull(),
+    issuer: varchar("issuer", { length: 180 }).notNull(),
+    certificateNumber: varchar("certificateNumber", { length: 100 }),
+    issuedDate: date("issuedDate"),
+    expiryDate: date("expiryDate"),
+    status: mysqlEnum("status", ["valid", "expiring", "expired", "not_required"]).default("valid").notNull(),
+    attachmentKey: varchar("attachmentKey", { length: 512 }),
+    notes: text("notes"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [index("qualifications_employee_idx").on(table.employeeId), index("qualifications_expiry_idx").on(table.status, table.expiryDate)]
+);
+var employeeDocuments = mysqlTable(
+  "employeeDocuments",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    employeeId: int("employeeId").notNull().references(() => employees.id, { onDelete: "cascade" }),
+    documentType: mysqlEnum("documentType", ["passport", "visa", "medical_insurance", "contract", "identity", "other"]).notNull(),
+    title: varchar("title", { length: 180 }).notNull(),
+    referenceNumber: varchar("referenceNumber", { length: 100 }),
+    expiryDate: date("expiryDate"),
+    fileKey: varchar("fileKey", { length: 512 }),
+    notes: text("notes"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [index("documents_employee_idx").on(table.employeeId), index("documents_expiry_idx").on(table.expiryDate)]
+);
+var employeeAssignments = mysqlTable(
+  "employeeAssignments",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    employeeId: int("employeeId").notNull().references(() => employees.id, { onDelete: "cascade" }),
+    projectId: int("projectId").notNull().references(() => projects.id, { onDelete: "cascade" }),
+    roleOnProject: varchar("roleOnProject", { length: 160 }).notNull(),
+    startDate: date("startDate").notNull(),
+    endDate: date("endDate"),
+    status: mysqlEnum("status", ["active", "completed", "cancelled"]).default("active").notNull(),
+    notes: text("notes"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [index("assignments_employee_idx").on(table.employeeId), index("assignments_project_idx").on(table.projectId), index("assignments_status_idx").on(table.status)]
+);
+var fiberDrums = mysqlTable(
+  "fiberDrums",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    drumId: varchar("drumId", { length: 64 }).notNull(),
+    fiberSpec: varchar("fiberSpec", { length: 180 }).notNull(),
+    coreCount: int("coreCount").notNull(),
+    supplier: varchar("supplier", { length: 160 }),
+    totalMeters: int("totalMeters").notNull(),
+    remainingMeters: int("remainingMeters").notNull(),
+    minimumMeters: int("minimumMeters").notNull().default(0),
+    assignedProjectId: int("assignedProjectId").references(() => projects.id, { onDelete: "set null" }),
+    storageLocation: varchar("storageLocation", { length: 160 }).notNull(),
+    status: mysqlEnum("status", ["available", "allocated", "low_stock", "depleted"]).default("available").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [uniqueIndex("fiber_drums_id_unique").on(table.drumId), index("fiber_drums_status_idx").on(table.status)]
+);
+var fieldEquipment = mysqlTable(
+  "fieldEquipment",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    assetTag: varchar("assetTag", { length: 64 }).notNull(),
+    name: varchar("name", { length: 180 }).notNull(),
+    category: mysqlEnum("category", ["splicer", "otdr", "power_meter", "safety", "other"]).notNull(),
+    serialNumber: varchar("serialNumber", { length: 100 }),
+    calibrationDueAt: date("calibrationDueAt"),
+    status: mysqlEnum("status", ["ready", "assigned", "maintenance", "calibration_due"]).default("ready").notNull(),
+    assignedEmployeeId: int("assignedEmployeeId").references(() => employees.id, { onDelete: "set null" }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [uniqueIndex("equipment_tag_unique").on(table.assetTag), index("equipment_status_idx").on(table.status)]
+);
+var permits = mysqlTable(
+  "permits",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    permitNo: varchar("permitNo", { length: 80 }).notNull(),
+    issuer: mysqlEnum("issuer", ["public_works", "traffic", "municipality", "other"]).notNull(),
+    routeName: varchar("routeName", { length: 220 }).notNull(),
+    projectId: int("projectId").references(() => projects.id, { onDelete: "set null" }),
+    startDate: date("startDate").notNull(),
+    expiryDate: date("expiryDate").notNull(),
+    status: mysqlEnum("status", ["valid", "expiring", "expired", "under_renewal"]).default("valid").notNull(),
+    renewalReference: varchar("renewalReference", { length: 80 }),
+    notes: text("notes"),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [uniqueIndex("permits_number_unique").on(table.permitNo), index("permits_status_expiry_idx").on(table.status, table.expiryDate)]
+);
+var workRoutes = mysqlTable(
+  "workRoutes",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    routeCode: varchar("routeCode", { length: 64 }).notNull(),
+    name: varchar("name", { length: 220 }).notNull(),
+    projectId: int("projectId").references(() => projects.id, { onDelete: "set null" }),
+    contractorName: varchar("contractorName", { length: 180 }),
+    stage: mysqlEnum("stage", ["civil", "pulling", "splicing", "otdr", "handover"]).default("civil").notNull(),
+    progressPercent: int("progressPercent").notNull().default(0),
+    permitId: int("permitId").references(() => permits.id, { onDelete: "set null" }),
+    status: mysqlEnum("status", ["active", "blocked", "completed"]).default("active").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  },
+  (table) => [uniqueIndex("work_routes_code_unique").on(table.routeCode), index("work_routes_status_idx").on(table.status)]
+);
+var operationalAuditLogs = mysqlTable(
+  "operationalAuditLogs",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    actorUserId: int("actorUserId").references(() => users.id, { onDelete: "set null" }),
+    entityType: varchar("entityType", { length: 60 }).notNull(),
+    entityId: int("entityId").notNull(),
+    action: mysqlEnum("action", ["create", "update", "delete", "renew", "assign", "unassign", "issue"]).notNull(),
+    summary: varchar("summary", { length: 500 }).notNull(),
+    beforeJson: text("beforeJson"),
+    afterJson: text("afterJson"),
+    createdAt: timestamp("createdAt").defaultNow().notNull()
+  },
+  (table) => [index("audit_entity_idx").on(table.entityType, table.entityId), index("audit_actor_idx").on(table.actorUserId)]
+);
+
+// server/_core/env.ts
+var ENV = {
+  appId: process.env.VITE_APP_ID ?? "",
+  cookieSecret: process.env.JWT_SECRET ?? "",
+  databaseUrl: process.env.DATABASE_URL ?? "",
+  oAuthServerUrl: process.env.OAUTH_SERVER_URL ?? "",
+  ownerOpenId: process.env.OWNER_OPEN_ID ?? "",
+  isProduction: process.env.NODE_ENV === "production",
+  forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
+  forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? ""
+};
+
+// server/db.ts
+var _db = null;
+async function getDb() {
+  if (!_db && process.env.DATABASE_URL) {
+    try {
+      _db = drizzle(process.env.DATABASE_URL);
+    } catch (error) {
+      console.warn("[Database] Failed to connect:", error);
+      _db = null;
+    }
+  }
+  return _db;
+}
+async function requireDb() {
+  const db = await getDb();
+  if (!db) {
+    throw new Error("\u0642\u0627\u0639\u062F\u0629 \u0628\u064A\u0627\u0646\u0627\u062A FiberOps \u063A\u064A\u0631 \u0645\u062A\u0627\u062D\u0629 \u062D\u0627\u0644\u064A\u0627\u064B.");
+  }
+  return db;
+}
+async function upsertUser(user) {
+  if (!user.openId) {
+    throw new Error("User openId is required for upsert");
+  }
+  const db = await getDb();
+  if (!db) {
+    console.warn("[Database] Cannot upsert user: database not available");
+    return;
+  }
+  try {
+    const values = {
+      openId: user.openId
+    };
+    const updateSet = {};
+    const textFields = ["name", "email", "loginMethod"];
+    const assignNullable = (field) => {
+      const value = user[field];
+      if (value === void 0) return;
+      const normalized = value ?? null;
+      values[field] = normalized;
+      updateSet[field] = normalized;
+    };
+    textFields.forEach(assignNullable);
+    if (user.lastSignedIn !== void 0) {
+      values.lastSignedIn = user.lastSignedIn;
+      updateSet.lastSignedIn = user.lastSignedIn;
+    }
+    if (user.role !== void 0) {
+      values.role = user.role;
+      updateSet.role = user.role;
+    } else if (user.openId === ENV.ownerOpenId) {
+      values.role = "admin";
+      updateSet.role = "admin";
+    }
+    if (!values.lastSignedIn) {
+      values.lastSignedIn = /* @__PURE__ */ new Date();
+    }
+    if (Object.keys(updateSet).length === 0) {
+      updateSet.lastSignedIn = /* @__PURE__ */ new Date();
+    }
+    await db.insert(users).values(values).onDuplicateKeyUpdate({
+      set: updateSet
+    });
+  } catch (error) {
+    console.error("[Database] Failed to upsert user:", error);
+    throw error;
+  }
+}
+async function getUserByOpenId(openId) {
+  const db = await getDb();
+  if (!db) {
+    console.warn("[Database] Cannot get user: database not available");
+    return void 0;
+  }
+  const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
+  return result.length > 0 ? result[0] : void 0;
+}
+
+// server/_core/cookies.ts
+function isSecureRequest(req) {
+  if (req.protocol === "https") return true;
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  if (!forwardedProto) return false;
+  const protoList = Array.isArray(forwardedProto) ? forwardedProto : forwardedProto.split(",");
+  return protoList.some((proto) => proto.trim().toLowerCase() === "https");
+}
+function getSessionCookieOptions(req) {
+  return {
+    httpOnly: true,
+    path: "/",
+    sameSite: "none",
+    secure: isSecureRequest(req)
+  };
+}
+
+// shared/_core/errors.ts
+var HttpError = class extends Error {
+  constructor(statusCode, message) {
+    super(message);
+    this.statusCode = statusCode;
+    this.name = "HttpError";
+  }
+};
+var ForbiddenError = (msg) => new HttpError(403, msg);
+
+// server/_core/sdk.ts
+import axios from "axios";
+import { parse as parseCookieHeader } from "cookie";
+import { SignJWT, jwtVerify } from "jose";
+var isNonEmptyString = (value) => typeof value === "string" && value.length > 0;
+var EXCHANGE_TOKEN_PATH = `/webdev.v1.WebDevAuthPublicService/ExchangeToken`;
+var GET_USER_INFO_PATH = `/webdev.v1.WebDevAuthPublicService/GetUserInfo`;
+var GET_USER_INFO_WITH_JWT_PATH = `/webdev.v1.WebDevAuthPublicService/GetUserInfoWithJwt`;
+var OAuthService = class {
+  constructor(client) {
+    this.client = client;
+    console.log("[OAuth] Initialized with baseURL:", ENV.oAuthServerUrl);
+    if (!ENV.oAuthServerUrl) {
+      console.error(
+        "[OAuth] ERROR: OAUTH_SERVER_URL is not configured! Set OAUTH_SERVER_URL environment variable."
+      );
+    }
+  }
+  decodeState(state) {
+    return decodeOAuthState(state).redirectUri;
+  }
+  async getTokenByCode(code, state) {
+    const payload = {
+      clientId: ENV.appId,
+      grantType: "authorization_code",
+      code,
+      redirectUri: this.decodeState(state)
+    };
+    const { data } = await this.client.post(
+      EXCHANGE_TOKEN_PATH,
+      payload
+    );
+    return data;
+  }
+  async getUserInfoByToken(token) {
+    const { data } = await this.client.post(
+      GET_USER_INFO_PATH,
+      {
+        accessToken: token.accessToken
+      }
+    );
+    return data;
+  }
+};
+var createOAuthHttpClient = () => axios.create({
+  baseURL: ENV.oAuthServerUrl,
+  timeout: AXIOS_TIMEOUT_MS
+});
+var SDKServer = class {
+  client;
+  oauthService;
+  constructor(client = createOAuthHttpClient()) {
+    this.client = client;
+    this.oauthService = new OAuthService(this.client);
+  }
+  deriveLoginMethod(platforms, fallback) {
+    if (fallback && fallback.length > 0) return fallback;
+    if (!Array.isArray(platforms) || platforms.length === 0) return null;
+    const set = new Set(
+      platforms.filter((p) => typeof p === "string")
+    );
+    if (set.has("REGISTERED_PLATFORM_EMAIL")) return "email";
+    if (set.has("REGISTERED_PLATFORM_GOOGLE")) return "google";
+    if (set.has("REGISTERED_PLATFORM_APPLE")) return "apple";
+    if (set.has("REGISTERED_PLATFORM_MICROSOFT") || set.has("REGISTERED_PLATFORM_AZURE"))
+      return "microsoft";
+    if (set.has("REGISTERED_PLATFORM_GITHUB")) return "github";
+    const first = Array.from(set)[0];
+    return first ? first.toLowerCase() : null;
+  }
+  /**
+   * Exchange OAuth authorization code for access token
+   * @example
+   * const tokenResponse = await sdk.exchangeCodeForToken(code, state);
+   */
+  async exchangeCodeForToken(code, state) {
+    return this.oauthService.getTokenByCode(code, state);
+  }
+  /**
+   * Get user information using access token
+   * @example
+   * const userInfo = await sdk.getUserInfo(tokenResponse.accessToken);
+   */
+  async getUserInfo(accessToken) {
+    const data = await this.oauthService.getUserInfoByToken({
+      accessToken
+    });
+    const loginMethod = this.deriveLoginMethod(
+      data?.platforms,
+      data?.platform ?? data.platform ?? null
+    );
+    return {
+      ...data,
+      platform: loginMethod,
+      loginMethod
+    };
+  }
+  parseCookies(cookieHeader) {
+    if (!cookieHeader) {
+      return /* @__PURE__ */ new Map();
+    }
+    const parsed = parseCookieHeader(cookieHeader);
+    return new Map(Object.entries(parsed));
+  }
+  getSessionSecret() {
+    const secret = ENV.cookieSecret;
+    return new TextEncoder().encode(secret);
+  }
+  /**
+   * Create a session token for a Manus user openId
+   * @example
+   * const sessionToken = await sdk.createSessionToken(userInfo.openId);
+   */
+  async createSessionToken(openId, options = {}) {
+    return this.signSession(
+      {
+        openId,
+        appId: ENV.appId,
+        name: options.name || ""
+      },
+      options
+    );
+  }
+  async signSession(payload, options = {}) {
+    const issuedAt = Date.now();
+    const expiresInMs = options.expiresInMs ?? ONE_YEAR_MS;
+    const expirationSeconds = Math.floor((issuedAt + expiresInMs) / 1e3);
+    const secretKey = this.getSessionSecret();
+    return new SignJWT({
+      openId: payload.openId,
+      appId: payload.appId,
+      name: payload.name
+    }).setProtectedHeader({ alg: "HS256", typ: "JWT" }).setExpirationTime(expirationSeconds).sign(secretKey);
+  }
+  async verifySession(cookieValue) {
+    if (!cookieValue) {
+      console.warn("[Auth] Missing session cookie");
+      return null;
+    }
+    try {
+      const secretKey = this.getSessionSecret();
+      const { payload } = await jwtVerify(cookieValue, secretKey, {
+        algorithms: ["HS256"]
+      });
+      const { openId, appId, name } = payload;
+      if (!isNonEmptyString(openId) || !isNonEmptyString(appId) || !isNonEmptyString(name)) {
+        console.warn("[Auth] Session payload missing required fields");
+        return null;
+      }
+      return {
+        openId,
+        appId,
+        name
+      };
+    } catch (error) {
+      console.warn("[Auth] Session verification failed", String(error));
+      return null;
+    }
+  }
+  async getUserInfoWithJwt(jwtToken) {
+    const payload = {
+      jwtToken,
+      projectId: ENV.appId
+    };
+    const { data } = await this.client.post(
+      GET_USER_INFO_WITH_JWT_PATH,
+      payload
+    );
+    const loginMethod = this.deriveLoginMethod(
+      data?.platforms,
+      data?.platform ?? data.platform ?? null
+    );
+    return {
+      ...data,
+      platform: loginMethod,
+      loginMethod
+    };
+  }
+  async authenticateRequest(req) {
+    const cookies = this.parseCookies(req.headers.cookie);
+    let sessionToken = cookies.get(COOKIE_NAME);
+    if (!sessionToken) {
+      const authHeader = req.headers.authorization;
+      if (typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
+        sessionToken = authHeader.slice(7);
+      }
+    }
+    const session = await this.verifySession(sessionToken);
+    if (!session) {
+      throw ForbiddenError("Invalid session cookie");
+    }
+    if (session.openId.startsWith(CRON_OPEN_ID_PREFIX)) {
+      const userInfo = await this.getUserInfoWithJwt(sessionToken ?? "");
+      const taskUid = userInfo.taskUid ?? null;
+      if (!taskUid) {
+        throw ForbiddenError("Cron session missing task_uid");
+      }
+      return buildCronUser(userInfo);
+    }
+    const sessionUserId = session.openId;
+    const signedInAt = /* @__PURE__ */ new Date();
+    let user = await getUserByOpenId(sessionUserId);
+    if (!user) {
+      try {
+        const userInfo = await this.getUserInfoWithJwt(sessionToken ?? "");
+        await upsertUser({
+          openId: userInfo.openId,
+          name: userInfo.name || null,
+          email: userInfo.email ?? null,
+          loginMethod: userInfo.loginMethod ?? userInfo.platform ?? null,
+          lastSignedIn: signedInAt
+        });
+        user = await getUserByOpenId(userInfo.openId);
+      } catch (error) {
+        console.error("[Auth] Failed to sync user from OAuth:", error);
+        throw ForbiddenError("Failed to sync user info");
+      }
+    }
+    if (!user) {
+      throw ForbiddenError("User not found");
+    }
+    await upsertUser({
+      openId: user.openId,
+      lastSignedIn: signedInAt
+    });
+    return user;
+  }
+};
+var CRON_OPEN_ID_PREFIX = "cron_";
+function buildCronUser(userInfo) {
+  const now = /* @__PURE__ */ new Date();
+  return {
+    id: -1,
+    openId: userInfo.openId,
+    name: userInfo.name || "Manus Scheduled Task",
+    email: null,
+    loginMethod: null,
+    role: "user",
+    createdAt: now,
+    updatedAt: now,
+    lastSignedIn: now,
+    taskUid: userInfo.taskUid ?? void 0,
+    isCron: true
+  };
+}
+var sdk = new SDKServer();
+
+// server/_core/oauth.ts
+function getQueryParam(req, key) {
+  const value = req.query[key];
+  return typeof value === "string" ? value : void 0;
+}
+function registerOAuthRoutes(app) {
+  app.get("/api/oauth/callback", async (req, res) => {
+    const code = getQueryParam(req, "code");
+    const state = getQueryParam(req, "state");
+    if (!code || !state) {
+      res.status(400).json({ error: "code and state are required" });
+      return;
+    }
+    const { nonce } = decodeOAuthState(state);
+    const expectedNonce = parseCookieHeader2(req.headers.cookie ?? "")[OAUTH_STATE_COOKIE];
+    if (!nonce || nonce !== expectedNonce) {
+      res.status(403).json({ error: "invalid oauth state" });
+      return;
+    }
+    res.clearCookie(OAUTH_STATE_COOKIE, { path: "/", secure: true, sameSite: "none" });
+    try {
+      const tokenResponse = await sdk.exchangeCodeForToken(code, state);
+      const userInfo = await sdk.getUserInfo(tokenResponse.accessToken);
+      if (!userInfo.openId) {
+        res.status(400).json({ error: "openId missing from user info" });
+        return;
+      }
+      await upsertUser({
+        openId: userInfo.openId,
+        name: userInfo.name || null,
+        email: userInfo.email ?? null,
+        loginMethod: userInfo.loginMethod ?? userInfo.platform ?? null,
+        lastSignedIn: /* @__PURE__ */ new Date()
+      });
+      const sessionToken = await sdk.createSessionToken(userInfo.openId, {
+        name: userInfo.name || "",
+        expiresInMs: ONE_YEAR_MS
+      });
+      const cookieOptions = getSessionCookieOptions(req);
+      res.cookie(COOKIE_NAME, sessionToken, { ...cookieOptions, maxAge: ONE_YEAR_MS });
+      res.redirect(302, "/");
+    } catch (error) {
+      console.error("[OAuth] Callback failed", error);
+      res.status(500).json({ error: "OAuth callback failed" });
+    }
+  });
+}
+
+// server/_core/storageProxy.ts
+function registerStorageProxy(app) {
+  app.get("/manus-storage/*", async (req, res) => {
+    const key = req.params[0];
+    if (!key) {
+      res.status(400).send("Missing storage key");
+      return;
+    }
+    if (!ENV.forgeApiUrl || !ENV.forgeApiKey) {
+      res.status(500).send("Storage proxy not configured");
+      return;
+    }
+    try {
+      const forgeUrl = new URL(
+        "v1/storage/presign/get",
+        ENV.forgeApiUrl.replace(/\/+$/, "") + "/"
+      );
+      forgeUrl.searchParams.set("path", key);
+      const forgeResp = await fetch(forgeUrl, {
+        headers: { Authorization: `Bearer ${ENV.forgeApiKey}` }
+      });
+      if (!forgeResp.ok) {
+        const body = await forgeResp.text().catch(() => "");
+        console.error(`[StorageProxy] forge error: ${forgeResp.status} ${body}`);
+        res.status(502).send("Storage backend error");
+        return;
+      }
+      const { url } = await forgeResp.json();
+      if (!url) {
+        res.status(502).send("Empty signed URL from backend");
+        return;
+      }
+      res.set("Cache-Control", "no-store");
+      res.redirect(307, url);
+    } catch (err) {
+      console.error("[StorageProxy] failed:", err);
+      res.status(502).send("Storage proxy error");
+    }
+  });
+}
+
+// server/_core/systemRouter.ts
+import { z } from "zod";
+
+// server/_core/notification.ts
+import { TRPCError } from "@trpc/server";
+var TITLE_MAX_LENGTH = 1200;
+var CONTENT_MAX_LENGTH = 2e4;
+var trimValue = (value) => value.trim();
+var isNonEmptyString2 = (value) => typeof value === "string" && value.trim().length > 0;
+var buildEndpointUrl = (baseUrl) => {
+  const normalizedBase = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  return new URL(
+    "webdevtoken.v1.WebDevService/SendNotification",
+    normalizedBase
+  ).toString();
+};
+var validatePayload = (input) => {
+  if (!isNonEmptyString2(input.title)) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: "Notification title is required."
+    });
+  }
+  if (!isNonEmptyString2(input.content)) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: "Notification content is required."
+    });
+  }
+  const title = trimValue(input.title);
+  const content = trimValue(input.content);
+  if (title.length > TITLE_MAX_LENGTH) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: `Notification title must be at most ${TITLE_MAX_LENGTH} characters.`
+    });
+  }
+  if (content.length > CONTENT_MAX_LENGTH) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: `Notification content must be at most ${CONTENT_MAX_LENGTH} characters.`
+    });
+  }
+  return { title, content };
+};
+async function notifyOwner(payload) {
+  const { title, content } = validatePayload(payload);
+  if (!ENV.forgeApiUrl) {
+    throw new TRPCError({
+      code: "INTERNAL_SERVER_ERROR",
+      message: "Notification service URL is not configured."
+    });
+  }
+  if (!ENV.forgeApiKey) {
+    throw new TRPCError({
+      code: "INTERNAL_SERVER_ERROR",
+      message: "Notification service API key is not configured."
+    });
+  }
+  const endpoint = buildEndpointUrl(ENV.forgeApiUrl);
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${ENV.forgeApiKey}`,
+        "content-type": "application/json",
+        "connect-protocol-version": "1"
+      },
+      body: JSON.stringify({ title, content })
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      console.warn(
+        `[Notification] Failed to notify owner (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`
+      );
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.warn("[Notification] Error calling notification service:", error);
+    return false;
+  }
+}
+
+// server/_core/trpc.ts
+import { initTRPC, TRPCError as TRPCError2 } from "@trpc/server";
+import superjson from "superjson";
+var t = initTRPC.context().create({
+  transformer: superjson
+});
+var router = t.router;
+var publicProcedure = t.procedure;
+var requireUser = t.middleware(async (opts) => {
+  const { ctx, next } = opts;
+  if (!ctx.user) {
+    throw new TRPCError2({ code: "UNAUTHORIZED", message: UNAUTHED_ERR_MSG });
+  }
+  return next({
+    ctx: {
+      ...ctx,
+      user: ctx.user
+    }
+  });
+});
+var protectedProcedure = t.procedure.use(requireUser);
+var adminProcedure = t.procedure.use(
+  t.middleware(async (opts) => {
+    const { ctx, next } = opts;
+    if (!ctx.user || ctx.user.role !== "admin") {
+      throw new TRPCError2({ code: "FORBIDDEN", message: NOT_ADMIN_ERR_MSG });
+    }
+    return next({
+      ctx: {
+        ...ctx,
+        user: ctx.user
+      }
+    });
+  })
+);
+
+// server/_core/systemRouter.ts
+var systemRouter = router({
+  health: publicProcedure.input(
+    z.object({
+      timestamp: z.number().min(0, "timestamp cannot be negative")
+    })
+  ).query(() => ({
+    ok: true
+  })),
+  notifyOwner: adminProcedure.input(
+    z.object({
+      title: z.string().min(1, "title is required"),
+      content: z.string().min(1, "content is required")
+    })
+  ).mutation(async ({ input }) => {
+    const delivered = await notifyOwner(input);
+    return {
+      success: delivered
+    };
+  })
+});
+
+// server/routers/operations.ts
+import { asc, eq as eq2 } from "drizzle-orm";
+import { z as z2 } from "zod";
+var dateField = z2.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+var optionalDate = dateField.nullable().optional();
+var optionalText = z2.string().trim().max(500).nullable().optional();
+var optionalId = z2.number().int().positive().nullable().optional();
+var idInput = z2.object({ id: z2.number().int().positive() });
+var departmentInput = z2.object({ name: z2.string().trim().min(2).max(120), code: z2.string().trim().min(2).max(32), managerName: z2.string().trim().max(160).nullable().optional(), active: z2.enum(["yes", "no"]).default("yes") });
+var projectInput = z2.object({ code: z2.string().trim().min(2).max(40), name: z2.string().trim().min(2).max(180), clientName: z2.string().trim().max(180).nullable().optional(), status: z2.enum(["planning", "active", "paused", "completed"]).default("planning"), startDate: optionalDate, targetDate: optionalDate });
+var drumInput = z2.object({ drumId: z2.string().trim().min(2).max(64), fiberSpec: z2.string().trim().min(2).max(180), coreCount: z2.number().int().min(1).max(288), supplier: z2.string().trim().max(160).nullable().optional(), totalMeters: z2.number().int().positive(), remainingMeters: z2.number().int().min(0), minimumMeters: z2.number().int().min(0).default(0), assignedProjectId: optionalId, storageLocation: z2.string().trim().min(2).max(160) });
+var equipmentInput = z2.object({ assetTag: z2.string().trim().min(2).max(64), name: z2.string().trim().min(2).max(180), category: z2.enum(["splicer", "otdr", "power_meter", "safety", "other"]), serialNumber: z2.string().trim().max(100).nullable().optional(), calibrationDueAt: optionalDate, status: z2.enum(["ready", "assigned", "maintenance", "calibration_due"]).default("ready"), assignedEmployeeId: optionalId });
+var permitInput = z2.object({ permitNo: z2.string().trim().min(2).max(80), issuer: z2.enum(["public_works", "traffic", "municipality", "other"]), routeName: z2.string().trim().min(2).max(220), projectId: optionalId, startDate: dateField, expiryDate: dateField, renewalReference: z2.string().trim().max(80).nullable().optional(), notes: optionalText });
+var routeInput = z2.object({ routeCode: z2.string().trim().min(2).max(64), name: z2.string().trim().min(2).max(220), projectId: optionalId, contractorName: z2.string().trim().max(180).nullable().optional(), stage: z2.enum(["civil", "pulling", "splicing", "otdr", "handover"]).default("civil"), progressPercent: z2.number().int().min(0).max(100), permitId: optionalId, status: z2.enum(["active", "blocked", "completed"]).default("active") });
+function toDbDate(value) {
+  if (value === void 0) return void 0;
+  if (value === null) return null;
+  return /* @__PURE__ */ new Date(`${value}T00:00:00`);
+}
+function insertId(result) {
+  const value = Array.isArray(result) ? result[0] : result;
+  return Number(value.insertId ?? 0);
+}
+function permitStatus(expiryDate) {
+  const today = /* @__PURE__ */ new Date();
+  today.setHours(0, 0, 0, 0);
+  const remaining = Math.ceil(((/* @__PURE__ */ new Date(`${expiryDate}T00:00:00`)).getTime() - today.getTime()) / 864e5);
+  if (remaining <= 0) return "expired";
+  if (remaining <= 60) return "expiring";
+  return "valid";
+}
+function drumStatus(input) {
+  if (input.remainingMeters <= 0) return "depleted";
+  if (input.remainingMeters <= input.minimumMeters) return "low_stock";
+  if (input.remainingMeters < input.totalMeters) return "allocated";
+  return "available";
+}
+async function audit(actorUserId, entityType, entityId, action, summary, before, after) {
+  const db = await requireDb();
+  await db.insert(operationalAuditLogs).values({ actorUserId, entityType, entityId, action, summary, beforeJson: before ? JSON.stringify(before) : null, afterJson: after ? JSON.stringify(after) : null });
+}
+var operationsRouter = router({
+  list: adminProcedure.query(async () => {
+    const db = await requireDb();
+    const [departmentRows, projectRows, drumRows, equipmentRows, permitRows, routeRows, employeeRows] = await Promise.all([
+      db.select().from(departments).orderBy(asc(departments.name)),
+      db.select().from(projects).orderBy(asc(projects.name)),
+      db.select().from(fiberDrums).orderBy(asc(fiberDrums.drumId)),
+      db.select().from(fieldEquipment).orderBy(asc(fieldEquipment.assetTag)),
+      db.select().from(permits).orderBy(asc(permits.expiryDate)),
+      db.select().from(workRoutes).orderBy(asc(workRoutes.routeCode)),
+      db.select({ id: employees.id, employeeNo: employees.employeeNo, firstName: employees.firstName, lastName: employees.lastName, jobTitle: employees.jobTitle }).from(employees).orderBy(asc(employees.employeeNo))
+    ]);
+    return { departments: departmentRows, projects: projectRows, drums: drumRows, equipment: equipmentRows, permits: permitRows, routes: routeRows, employees: employeeRows };
+  }),
+  overview: adminProcedure.query(async () => {
+    const db = await requireDb();
+    const [employeeRows, drumRows, equipmentRows, permitRows, routeRows] = await Promise.all([db.select().from(employees), db.select().from(fiberDrums), db.select().from(fieldEquipment), db.select().from(permits), db.select().from(workRoutes)]);
+    return {
+      employees: employeeRows.filter((row) => row.employmentStatus === "active").length,
+      lowStockDrums: drumRows.filter((row) => row.status === "low_stock" || row.status === "depleted").length,
+      calibrationDue: equipmentRows.filter((row) => row.status === "calibration_due").length,
+      criticalPermits: permitRows.filter((row) => row.status === "expired" || row.status === "expiring").length,
+      blockedRoutes: routeRows.filter((row) => row.status === "blocked").length
+    };
+  }),
+  createDepartment: adminProcedure.input(departmentInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const result = await db.insert(departments).values(input);
+    const id = insertId(result);
+    await audit(ctx.user.id, "department", id, "create", `\u0625\u0636\u0627\u0641\u0629 \u0642\u0633\u0645 ${input.name}`, void 0, input);
+    return { id };
+  }),
+  updateDepartment: adminProcedure.input(idInput.merge(departmentInput)).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(departments).where(eq2(departments.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u0642\u0633\u0645 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F.");
+    const { id, ...values } = input;
+    await db.update(departments).set(values).where(eq2(departments.id, id));
+    await audit(ctx.user.id, "department", id, "update", `\u062A\u0639\u062F\u064A\u0644 \u0642\u0633\u0645 ${before.name}`, before, values);
+    return { success: true };
+  }),
+  deleteDepartment: adminProcedure.input(idInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(departments).where(eq2(departments.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u0642\u0633\u0645 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F.");
+    await db.delete(departments).where(eq2(departments.id, input.id));
+    await audit(ctx.user.id, "department", input.id, "delete", `\u062D\u0630\u0641 \u0642\u0633\u0645 ${before.name}`, before);
+    return { success: true };
+  }),
+  createProject: adminProcedure.input(projectInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const result = await db.insert(projects).values({ ...input, startDate: toDbDate(input.startDate), targetDate: toDbDate(input.targetDate) });
+    const id = insertId(result);
+    await audit(ctx.user.id, "project", id, "create", `\u0625\u0636\u0627\u0641\u0629 \u0645\u0634\u0631\u0648\u0639 ${input.code}`, void 0, input);
+    return { id };
+  }),
+  updateProject: adminProcedure.input(idInput.merge(projectInput)).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(projects).where(eq2(projects.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u0645\u0634\u0631\u0648\u0639 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F.");
+    const { id, startDate, targetDate, ...values } = input;
+    await db.update(projects).set({ ...values, startDate: toDbDate(startDate), targetDate: toDbDate(targetDate) }).where(eq2(projects.id, id));
+    await audit(ctx.user.id, "project", id, "update", `\u062A\u0639\u062F\u064A\u0644 \u0645\u0634\u0631\u0648\u0639 ${before.code}`, before, values);
+    return { success: true };
+  }),
+  deleteProject: adminProcedure.input(idInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(projects).where(eq2(projects.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u0645\u0634\u0631\u0648\u0639 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F.");
+    await db.delete(projects).where(eq2(projects.id, input.id));
+    await audit(ctx.user.id, "project", input.id, "delete", `\u062D\u0630\u0641 \u0645\u0634\u0631\u0648\u0639 ${before.code}`, before);
+    return { success: true };
+  }),
+  createDrum: adminProcedure.input(drumInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const status = drumStatus(input);
+    const result = await db.insert(fiberDrums).values({ ...input, status });
+    const id = insertId(result);
+    await audit(ctx.user.id, "drum", id, "create", `\u0625\u0636\u0627\u0641\u0629 \u0628\u0643\u0631\u0629 ${input.drumId}`, void 0, input);
+    return { id };
+  }),
+  updateDrum: adminProcedure.input(idInput.merge(drumInput)).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(fiberDrums).where(eq2(fiberDrums.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u0628\u0643\u0631\u0629 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F\u0629.");
+    const { id, ...values } = input;
+    await db.update(fiberDrums).set({ ...values, status: drumStatus(values) }).where(eq2(fiberDrums.id, id));
+    await audit(ctx.user.id, "drum", id, "update", `\u062A\u0639\u062F\u064A\u0644 \u0628\u0643\u0631\u0629 ${before.drumId}`, before, values);
+    return { success: true };
+  }),
+  deleteDrum: adminProcedure.input(idInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(fiberDrums).where(eq2(fiberDrums.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u0628\u0643\u0631\u0629 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F\u0629.");
+    await db.delete(fiberDrums).where(eq2(fiberDrums.id, input.id));
+    await audit(ctx.user.id, "drum", input.id, "delete", `\u062D\u0630\u0641 \u0628\u0643\u0631\u0629 ${before.drumId}`, before);
+    return { success: true };
+  }),
+  createEquipment: adminProcedure.input(equipmentInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const result = await db.insert(fieldEquipment).values({ ...input, calibrationDueAt: toDbDate(input.calibrationDueAt) });
+    const id = insertId(result);
+    await audit(ctx.user.id, "equipment", id, "create", `\u0625\u0636\u0627\u0641\u0629 \u0623\u0635\u0644 ${input.assetTag}`, void 0, input);
+    return { id };
+  }),
+  updateEquipment: adminProcedure.input(idInput.merge(equipmentInput)).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(fieldEquipment).where(eq2(fieldEquipment.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u0645\u0639\u062F\u0629 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F\u0629.");
+    const { id, calibrationDueAt, ...values } = input;
+    await db.update(fieldEquipment).set({ ...values, calibrationDueAt: toDbDate(calibrationDueAt) }).where(eq2(fieldEquipment.id, id));
+    await audit(ctx.user.id, "equipment", id, "update", `\u062A\u0639\u062F\u064A\u0644 \u0623\u0635\u0644 ${before.assetTag}`, before, values);
+    return { success: true };
+  }),
+  assignEquipment: adminProcedure.input(z2.object({ id: z2.number().int().positive(), employeeId: z2.number().int().positive() })).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(fieldEquipment).where(eq2(fieldEquipment.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u0645\u0639\u062F\u0629 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F\u0629.");
+    await db.update(fieldEquipment).set({ assignedEmployeeId: input.employeeId, status: "assigned" }).where(eq2(fieldEquipment.id, input.id));
+    await audit(ctx.user.id, "equipment", input.id, "assign", `\u062A\u0639\u064A\u064A\u0646 \u0623\u0635\u0644 ${before.assetTag} \u0644\u0644\u0639\u0627\u0645\u0644 ${input.employeeId}`, before, input);
+    return { success: true };
+  }),
+  releaseEquipment: adminProcedure.input(idInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(fieldEquipment).where(eq2(fieldEquipment.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u0645\u0639\u062F\u0629 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F\u0629.");
+    await db.update(fieldEquipment).set({ assignedEmployeeId: null, status: "ready" }).where(eq2(fieldEquipment.id, input.id));
+    await audit(ctx.user.id, "equipment", input.id, "unassign", `\u0625\u0644\u063A\u0627\u0621 \u062A\u0639\u064A\u064A\u0646 \u0623\u0635\u0644 ${before.assetTag}`, before);
+    return { success: true };
+  }),
+  deleteEquipment: adminProcedure.input(idInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(fieldEquipment).where(eq2(fieldEquipment.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u0645\u0639\u062F\u0629 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F\u0629.");
+    await db.delete(fieldEquipment).where(eq2(fieldEquipment.id, input.id));
+    await audit(ctx.user.id, "equipment", input.id, "delete", `\u062D\u0630\u0641 \u0623\u0635\u0644 ${before.assetTag}`, before);
+    return { success: true };
+  }),
+  createPermit: adminProcedure.input(permitInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const result = await db.insert(permits).values({ ...input, startDate: toDbDate(input.startDate), expiryDate: toDbDate(input.expiryDate), status: permitStatus(input.expiryDate) });
+    const id = insertId(result);
+    await audit(ctx.user.id, "permit", id, "create", `\u0625\u0635\u062F\u0627\u0631 \u062A\u0635\u0631\u064A\u062D ${input.permitNo}`, void 0, input);
+    return { id };
+  }),
+  updatePermit: adminProcedure.input(idInput.merge(permitInput)).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(permits).where(eq2(permits.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u062A\u0635\u0631\u064A\u062D \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F.");
+    const { id, startDate, expiryDate, ...values } = input;
+    await db.update(permits).set({ ...values, startDate: toDbDate(startDate), expiryDate: toDbDate(expiryDate), status: permitStatus(expiryDate) }).where(eq2(permits.id, id));
+    await audit(ctx.user.id, "permit", id, "update", `\u062A\u0639\u062F\u064A\u0644 \u062A\u0635\u0631\u064A\u062D ${before.permitNo}`, before, values);
+    return { success: true };
+  }),
+  renewPermit: adminProcedure.input(z2.object({ id: z2.number().int().positive(), expiryDate: dateField, renewalReference: z2.string().trim().max(80).nullable().optional(), notes: optionalText })).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(permits).where(eq2(permits.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u062A\u0635\u0631\u064A\u062D \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F.");
+    await db.update(permits).set({ expiryDate: toDbDate(input.expiryDate), renewalReference: input.renewalReference, notes: input.notes, status: permitStatus(input.expiryDate) }).where(eq2(permits.id, input.id));
+    await audit(ctx.user.id, "permit", input.id, "renew", `\u062A\u062C\u062F\u064A\u062F \u062A\u0635\u0631\u064A\u062D ${before.permitNo}`, before, input);
+    return { success: true };
+  }),
+  deletePermit: adminProcedure.input(idInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(permits).where(eq2(permits.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u062A\u0635\u0631\u064A\u062D \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F.");
+    await db.delete(permits).where(eq2(permits.id, input.id));
+    await audit(ctx.user.id, "permit", input.id, "delete", `\u062D\u0630\u0641 \u062A\u0635\u0631\u064A\u062D ${before.permitNo}`, before);
+    return { success: true };
+  }),
+  createRoute: adminProcedure.input(routeInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const result = await db.insert(workRoutes).values(input);
+    const id = insertId(result);
+    await audit(ctx.user.id, "route", id, "create", `\u0625\u0636\u0627\u0641\u0629 \u0645\u0633\u0627\u0631 ${input.routeCode}`, void 0, input);
+    return { id };
+  }),
+  updateRoute: adminProcedure.input(idInput.merge(routeInput)).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(workRoutes).where(eq2(workRoutes.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u0645\u0633\u0627\u0631 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F.");
+    const { id, ...values } = input;
+    await db.update(workRoutes).set(values).where(eq2(workRoutes.id, id));
+    await audit(ctx.user.id, "route", id, "update", `\u062A\u0639\u062F\u064A\u0644 \u0645\u0633\u0627\u0631 ${before.routeCode}`, before, values);
+    return { success: true };
+  }),
+  deleteRoute: adminProcedure.input(idInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(workRoutes).where(eq2(workRoutes.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0627\u0644\u0645\u0633\u0627\u0631 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F.");
+    await db.delete(workRoutes).where(eq2(workRoutes.id, input.id));
+    await audit(ctx.user.id, "route", input.id, "delete", `\u062D\u0630\u0641 \u0645\u0633\u0627\u0631 ${before.routeCode}`, before);
+    return { success: true };
+  }),
+  refreshPermitStatuses: adminProcedure.mutation(async ({ ctx }) => {
+    const db = await requireDb();
+    const rows = await db.select().from(permits);
+    let changed = 0;
+    for (const permit of rows) {
+      const nextStatus = permitStatus(permit.expiryDate instanceof Date ? permit.expiryDate.toISOString().slice(0, 10) : String(permit.expiryDate));
+      if (permit.status !== nextStatus) {
+        await db.update(permits).set({ status: nextStatus }).where(eq2(permits.id, permit.id));
+        changed += 1;
+      }
+    }
+    await audit(ctx.user.id, "permit", 0, "update", `\u062A\u062D\u062F\u064A\u062B \u062D\u0627\u0644\u0627\u062A \u0627\u0644\u062A\u0635\u0627\u0631\u064A\u062D: ${changed} \u0633\u062C\u0644\u0627\u064B`);
+    return { changed };
+  })
+});
+
+// server/routers/workforce.ts
+import { and, asc as asc2, eq as eq3 } from "drizzle-orm";
+import { z as z3 } from "zod";
+var dateField2 = z3.string().regex(/^\d{4}-\d{2}-\d{2}$/, "\u0627\u0644\u062A\u0627\u0631\u064A\u062E \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0628\u0635\u064A\u063A\u0629 YYYY-MM-DD");
+var optionalDateField = dateField2.nullable().optional();
+var optionalText2 = z3.string().trim().max(500).nullable().optional();
+var optionalId2 = z3.number().int().positive().nullable().optional();
+var idField = z3.object({ id: z3.number().int().positive() });
+var employeeInput = z3.object({
+  employeeNo: z3.string().trim().min(2).max(40),
+  firstName: z3.string().trim().min(2).max(100),
+  lastName: z3.string().trim().min(2).max(100),
+  jobTitle: z3.string().trim().min(2).max(150),
+  nationality: z3.string().trim().min(2).max(90),
+  phone: z3.string().trim().max(32).nullable().optional(),
+  email: z3.string().trim().email().max(320).nullable().optional(),
+  passportNumber: z3.string().trim().max(64).nullable().optional(),
+  passportExpiryAt: optionalDateField,
+  joiningDate: dateField2,
+  employmentStatus: z3.enum(["active", "on_leave", "suspended", "terminated"]).default("active"),
+  departmentId: optionalId2,
+  primaryProjectId: optionalId2,
+  emergencyContactName: z3.string().trim().max(160).nullable().optional(),
+  emergencyContactPhone: z3.string().trim().max(32).nullable().optional(),
+  notes: optionalText2
+});
+var residencyInput = z3.object({
+  iqamaNumber: z3.string().trim().min(4).max(64),
+  sponsorName: z3.string().trim().max(180).nullable().optional(),
+  issueDate: optionalDateField,
+  expiryDate: dateField2,
+  status: z3.enum(["valid", "expiring", "expired", "under_renewal"]).default("valid"),
+  renewalReference: z3.string().trim().max(80).nullable().optional(),
+  renewalNotes: optionalText2
+});
+var qualificationInput = z3.object({
+  employeeId: z3.number().int().positive(),
+  name: z3.string().trim().min(2).max(180),
+  issuer: z3.string().trim().min(2).max(180),
+  certificateNumber: z3.string().trim().max(100).nullable().optional(),
+  issuedDate: optionalDateField,
+  expiryDate: optionalDateField,
+  status: z3.enum(["valid", "expiring", "expired", "not_required"]).default("valid"),
+  notes: optionalText2
+});
+var documentInput = z3.object({
+  employeeId: z3.number().int().positive(),
+  documentType: z3.enum(["passport", "visa", "medical_insurance", "contract", "identity", "other"]),
+  title: z3.string().trim().min(2).max(180),
+  referenceNumber: z3.string().trim().max(100).nullable().optional(),
+  expiryDate: optionalDateField,
+  notes: optionalText2
+});
+var assignmentInput = z3.object({
+  employeeId: z3.number().int().positive(),
+  projectId: z3.number().int().positive(),
+  roleOnProject: z3.string().trim().min(2).max(160),
+  startDate: dateField2,
+  endDate: optionalDateField,
+  notes: optionalText2
+});
+function insertId2(result) {
+  const value = Array.isArray(result) ? result[0] : result;
+  return Number(value.insertId ?? 0);
+}
+function toDbDate2(value) {
+  if (value === void 0) return void 0;
+  if (value === null) return null;
+  return /* @__PURE__ */ new Date(`${value}T00:00:00`);
+}
+function daysUntil(dateValue) {
+  const start = /* @__PURE__ */ new Date();
+  start.setHours(0, 0, 0, 0);
+  const target = dateValue instanceof Date ? dateValue : /* @__PURE__ */ new Date(`${dateValue}T00:00:00`);
+  return Math.ceil((target.getTime() - start.getTime()) / 864e5);
+}
+function residencyComplianceStatus(dateValue) {
+  const remaining = daysUntil(dateValue);
+  if (remaining <= 0) return "expired";
+  if (remaining <= 60) return "expiring";
+  return "valid";
+}
+function qualificationComplianceStatus(dateValue) {
+  if (!dateValue) return "not_required";
+  return residencyComplianceStatus(dateValue);
+}
+async function audit2(input) {
+  const db = await requireDb();
+  await db.insert(operationalAuditLogs).values({
+    actorUserId: input.actorUserId,
+    entityType: input.entityType,
+    entityId: input.entityId,
+    action: input.action,
+    summary: input.summary,
+    beforeJson: input.before ? JSON.stringify(input.before) : null,
+    afterJson: input.after ? JSON.stringify(input.after) : null
+  });
+}
+var workforceRouter = router({
+  list: adminProcedure.query(async () => {
+    const db = await requireDb();
+    const [employeeRows, departmentRows, projectRows, residencyRows, qualificationRows, documentRows, assignmentRows] = await Promise.all([
+      db.select().from(employees).orderBy(asc2(employees.employeeNo)),
+      db.select().from(departments).orderBy(asc2(departments.name)),
+      db.select().from(projects).orderBy(asc2(projects.name)),
+      db.select().from(residencyPermits),
+      db.select().from(employeeQualifications),
+      db.select().from(employeeDocuments),
+      db.select().from(employeeAssignments)
+    ]);
+    const departmentMap = new Map(departmentRows.map((row) => [row.id, row]));
+    const projectMap = new Map(projectRows.map((row) => [row.id, row]));
+    return {
+      employees: employeeRows.map((employee) => ({
+        ...employee,
+        department: employee.departmentId ? departmentMap.get(employee.departmentId) ?? null : null,
+        project: employee.primaryProjectId ? projectMap.get(employee.primaryProjectId) ?? null : null,
+        residency: residencyRows.find((row) => row.employeeId === employee.id) ?? null,
+        qualifications: qualificationRows.filter((row) => row.employeeId === employee.id),
+        documents: documentRows.filter((row) => row.employeeId === employee.id),
+        assignments: assignmentRows.filter((row) => row.employeeId === employee.id)
+      })),
+      departments: departmentRows,
+      projects: projectRows
+    };
+  }),
+  summary: adminProcedure.query(async () => {
+    const db = await requireDb();
+    const [employeeRows, residencyRows, qualificationRows] = await Promise.all([
+      db.select().from(employees),
+      db.select().from(residencyPermits),
+      db.select().from(employeeQualifications)
+    ]);
+    const criticalResidencies = residencyRows.filter((row) => row.status === "expired" || row.status === "expiring");
+    const criticalQualifications = qualificationRows.filter((row) => row.status === "expired" || row.status === "expiring");
+    return {
+      activeEmployees: employeeRows.filter((row) => row.employmentStatus === "active").length,
+      expiringResidencies: criticalResidencies.length,
+      expiringQualifications: criticalQualifications.length,
+      expiredCompliance: [...residencyRows, ...qualificationRows].filter((row) => row.status === "expired").length
+    };
+  }),
+  createEmployee: adminProcedure.input(employeeInput.extend({ residency: residencyInput.optional() })).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const { residency, ...employeeValues } = input;
+    const result = await db.insert(employees).values({
+      ...employeeValues,
+      joiningDate: toDbDate2(employeeValues.joiningDate),
+      passportExpiryAt: toDbDate2(employeeValues.passportExpiryAt)
+    });
+    const employeeId = insertId2(result);
+    if (residency) {
+      await db.insert(residencyPermits).values({
+        ...residency,
+        employeeId,
+        issueDate: toDbDate2(residency.issueDate),
+        expiryDate: toDbDate2(residency.expiryDate),
+        status: residencyComplianceStatus(residency.expiryDate)
+      });
+    }
+    await audit2({ actorUserId: ctx.user.id, entityType: "employee", entityId: employeeId, action: "create", summary: `\u0625\u0636\u0627\u0641\u0629 \u0645\u0644\u0641 \u0627\u0644\u0639\u0627\u0645\u0644 ${input.employeeNo}`, after: input });
+    return { id: employeeId };
+  }),
+  updateEmployee: adminProcedure.input(idField.merge(employeeInput.partial())).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(employees).where(eq3(employees.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0644\u0645 \u064A\u062A\u0645 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u0627\u0644\u0639\u0627\u0645\u0644 \u0627\u0644\u0645\u0637\u0644\u0648\u0628.");
+    const { id, joiningDate, passportExpiryAt, ...values } = input;
+    const updateValues = { ...values };
+    if (joiningDate !== void 0) updateValues.joiningDate = toDbDate2(joiningDate);
+    if (passportExpiryAt !== void 0) updateValues.passportExpiryAt = toDbDate2(passportExpiryAt);
+    await db.update(employees).set(updateValues).where(eq3(employees.id, id));
+    await audit2({ actorUserId: ctx.user.id, entityType: "employee", entityId: id, action: "update", summary: `\u062A\u0639\u062F\u064A\u0644 \u0645\u0644\u0641 \u0627\u0644\u0639\u0627\u0645\u0644 ${before.employeeNo}`, before, after: values });
+    return { success: true };
+  }),
+  deleteEmployee: adminProcedure.input(idField).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(employees).where(eq3(employees.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0644\u0645 \u064A\u062A\u0645 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u0627\u0644\u0639\u0627\u0645\u0644 \u0627\u0644\u0645\u0637\u0644\u0648\u0628.");
+    await db.delete(employees).where(eq3(employees.id, input.id));
+    await audit2({ actorUserId: ctx.user.id, entityType: "employee", entityId: input.id, action: "delete", summary: `\u062D\u0630\u0641 \u0645\u0644\u0641 \u0627\u0644\u0639\u0627\u0645\u0644 ${before.employeeNo}`, before });
+    return { success: true };
+  }),
+  renewResidency: adminProcedure.input(z3.object({ employeeId: z3.number().int().positive(), expiryDate: dateField2, renewalReference: z3.string().trim().max(80).nullable().optional(), renewalNotes: optionalText2 })).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(residencyPermits).where(eq3(residencyPermits.employeeId, input.employeeId)).limit(1))[0];
+    if (!before) throw new Error("\u0644\u0627 \u064A\u0648\u062C\u062F \u0633\u062C\u0644 \u0625\u0642\u0627\u0645\u0629 \u0645\u0631\u062A\u0628\u0637 \u0628\u0647\u0630\u0627 \u0627\u0644\u0639\u0627\u0645\u0644.");
+    const status = residencyComplianceStatus(input.expiryDate);
+    await db.update(residencyPermits).set({ expiryDate: toDbDate2(input.expiryDate), renewalReference: input.renewalReference, renewalNotes: input.renewalNotes, lastRenewedAt: /* @__PURE__ */ new Date(), status }).where(eq3(residencyPermits.employeeId, input.employeeId));
+    await audit2({ actorUserId: ctx.user.id, entityType: "residency", entityId: before.id, action: "renew", summary: `\u062A\u062C\u062F\u064A\u062F \u0625\u0642\u0627\u0645\u0629 \u0627\u0644\u0639\u0627\u0645\u0644 \u0631\u0642\u0645 ${before.employeeId}`, before, after: input });
+    return { success: true, status };
+  }),
+  createQualification: adminProcedure.input(qualificationInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const status = input.status === "not_required" ? "not_required" : qualificationComplianceStatus(input.expiryDate);
+    const result = await db.insert(employeeQualifications).values({ ...input, issuedDate: toDbDate2(input.issuedDate), expiryDate: toDbDate2(input.expiryDate), status });
+    const id = insertId2(result);
+    await audit2({ actorUserId: ctx.user.id, entityType: "qualification", entityId: id, action: "create", summary: `\u0625\u0636\u0627\u0641\u0629 \u0645\u0624\u0647\u0644 ${input.name}`, after: input });
+    return { id };
+  }),
+  updateQualification: adminProcedure.input(idField.merge(qualificationInput.omit({ employeeId: true }).partial())).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(employeeQualifications).where(eq3(employeeQualifications.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0644\u0645 \u064A\u062A\u0645 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u0627\u0644\u0645\u0624\u0647\u0644.");
+    const { id, issuedDate, expiryDate, ...values } = input;
+    const updateValues = { ...values };
+    if (issuedDate !== void 0) updateValues.issuedDate = toDbDate2(issuedDate);
+    if (expiryDate !== void 0) updateValues.expiryDate = toDbDate2(expiryDate);
+    await db.update(employeeQualifications).set(updateValues).where(eq3(employeeQualifications.id, id));
+    await audit2({ actorUserId: ctx.user.id, entityType: "qualification", entityId: id, action: "update", summary: `\u062A\u0639\u062F\u064A\u0644 \u0645\u0624\u0647\u0644 ${before.name}`, before, after: values });
+    return { success: true };
+  }),
+  deleteQualification: adminProcedure.input(idField).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(employeeQualifications).where(eq3(employeeQualifications.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0644\u0645 \u064A\u062A\u0645 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u0627\u0644\u0645\u0624\u0647\u0644.");
+    await db.delete(employeeQualifications).where(eq3(employeeQualifications.id, input.id));
+    await audit2({ actorUserId: ctx.user.id, entityType: "qualification", entityId: input.id, action: "delete", summary: `\u062D\u0630\u0641 \u0645\u0624\u0647\u0644 ${before.name}`, before });
+    return { success: true };
+  }),
+  createDocument: adminProcedure.input(documentInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const result = await db.insert(employeeDocuments).values({ ...input, expiryDate: toDbDate2(input.expiryDate) });
+    const id = insertId2(result);
+    await audit2({ actorUserId: ctx.user.id, entityType: "document", entityId: id, action: "create", summary: `\u0625\u0636\u0627\u0641\u0629 \u0648\u062B\u064A\u0642\u0629 ${input.title}`, after: input });
+    return { id };
+  }),
+  updateDocument: adminProcedure.input(idField.merge(documentInput.omit({ employeeId: true }).partial())).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(employeeDocuments).where(eq3(employeeDocuments.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0644\u0645 \u064A\u062A\u0645 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u0627\u0644\u0648\u062B\u064A\u0642\u0629.");
+    const { id, expiryDate, ...values } = input;
+    const updateValues = { ...values };
+    if (expiryDate !== void 0) updateValues.expiryDate = toDbDate2(expiryDate);
+    await db.update(employeeDocuments).set(updateValues).where(eq3(employeeDocuments.id, id));
+    await audit2({ actorUserId: ctx.user.id, entityType: "document", entityId: id, action: "update", summary: `\u062A\u0639\u062F\u064A\u0644 \u0648\u062B\u064A\u0642\u0629 ${before.title}`, before, after: values });
+    return { success: true };
+  }),
+  deleteDocument: adminProcedure.input(idField).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(employeeDocuments).where(eq3(employeeDocuments.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0644\u0645 \u064A\u062A\u0645 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u0627\u0644\u0648\u062B\u064A\u0642\u0629.");
+    await db.delete(employeeDocuments).where(eq3(employeeDocuments.id, input.id));
+    await audit2({ actorUserId: ctx.user.id, entityType: "document", entityId: input.id, action: "delete", summary: `\u062D\u0630\u0641 \u0648\u062B\u064A\u0642\u0629 ${before.title}`, before });
+    return { success: true };
+  }),
+  assignEmployee: adminProcedure.input(assignmentInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const result = await db.insert(employeeAssignments).values({ ...input, startDate: toDbDate2(input.startDate), endDate: toDbDate2(input.endDate), status: "active" });
+    const assignmentId = insertId2(result);
+    await db.update(employees).set({ primaryProjectId: input.projectId }).where(eq3(employees.id, input.employeeId));
+    await audit2({ actorUserId: ctx.user.id, entityType: "assignment", entityId: assignmentId, action: "assign", summary: `\u062A\u0639\u064A\u064A\u0646 \u0639\u0627\u0645\u0644 \u0639\u0644\u0649 \u0645\u0634\u0631\u0648\u0639 \u0631\u0642\u0645 ${input.projectId}`, after: input });
+    return { id: assignmentId };
+  }),
+  updateAssignment: adminProcedure.input(idField.merge(z3.object({
+    projectId: z3.number().int().positive().optional(),
+    roleOnProject: z3.string().trim().min(2).max(160).optional(),
+    startDate: dateField2.optional(),
+    endDate: optionalDateField,
+    status: z3.enum(["active", "completed", "cancelled"]).optional(),
+    notes: optionalText2
+  }))).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(employeeAssignments).where(eq3(employeeAssignments.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0644\u0645 \u064A\u062A\u0645 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u0627\u0644\u062A\u0643\u0644\u064A\u0641.");
+    const { id, startDate, endDate, ...values } = input;
+    const updateValues = { ...values };
+    if (startDate !== void 0) updateValues.startDate = toDbDate2(startDate);
+    if (endDate !== void 0) updateValues.endDate = toDbDate2(endDate);
+    await db.update(employeeAssignments).set(updateValues).where(eq3(employeeAssignments.id, id));
+    await audit2({ actorUserId: ctx.user.id, entityType: "assignment", entityId: id, action: "update", summary: `\u062A\u0639\u062F\u064A\u0644 \u062A\u0643\u0644\u064A\u0641 \u0627\u0644\u0639\u0627\u0645\u0644 \u0631\u0642\u0645 ${before.employeeId}`, before, after: values });
+    return { success: true };
+  }),
+  unassignEmployee: adminProcedure.input(idField).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const before = (await db.select().from(employeeAssignments).where(eq3(employeeAssignments.id, input.id)).limit(1))[0];
+    if (!before) throw new Error("\u0644\u0645 \u064A\u062A\u0645 \u0627\u0644\u0639\u062B\u0648\u0631 \u0639\u0644\u0649 \u0627\u0644\u062A\u0643\u0644\u064A\u0641.");
+    await db.update(employeeAssignments).set({ status: "cancelled", endDate: /* @__PURE__ */ new Date() }).where(eq3(employeeAssignments.id, input.id));
+    await audit2({ actorUserId: ctx.user.id, entityType: "assignment", entityId: input.id, action: "unassign", summary: `\u0625\u0644\u063A\u0627\u0621 \u062A\u0643\u0644\u064A\u0641 \u0627\u0644\u0639\u0627\u0645\u0644 \u0631\u0642\u0645 ${before.employeeId}`, before });
+    return { success: true };
+  }),
+  refreshCompliance: adminProcedure.mutation(async ({ ctx }) => {
+    const db = await requireDb();
+    const [residencies, qualifications] = await Promise.all([db.select().from(residencyPermits), db.select().from(employeeQualifications)]);
+    let changed = 0;
+    for (const residency of residencies) {
+      const nextStatus = residencyComplianceStatus(residency.expiryDate);
+      if (residency.status !== nextStatus) {
+        await db.update(residencyPermits).set({ status: nextStatus }).where(eq3(residencyPermits.id, residency.id));
+        changed += 1;
+      }
+    }
+    for (const qualification of qualifications) {
+      const nextStatus = qualification.status === "not_required" ? "not_required" : qualificationComplianceStatus(qualification.expiryDate);
+      if (qualification.status !== nextStatus) {
+        await db.update(employeeQualifications).set({ status: nextStatus }).where(eq3(employeeQualifications.id, qualification.id));
+        changed += 1;
+      }
+    }
+    await audit2({ actorUserId: ctx.user.id, entityType: "compliance", entityId: 0, action: "update", summary: `\u062A\u062D\u062F\u064A\u062B \u062D\u0627\u0644\u0627\u062A \u0627\u0644\u0627\u0645\u062A\u062B\u0627\u0644: ${changed} \u0633\u062C\u0644\u0627\u064B` });
+    return { changed };
+  }),
+  listAudit: adminProcedure.input(z3.object({ entityType: z3.string().trim().max(60).optional(), entityId: z3.number().int().positive().optional() }).optional()).query(async ({ input }) => {
+    const db = await requireDb();
+    if (input?.entityType && input.entityId) {
+      return db.select().from(operationalAuditLogs).where(and(eq3(operationalAuditLogs.entityType, input.entityType), eq3(operationalAuditLogs.entityId, input.entityId))).orderBy(asc2(operationalAuditLogs.createdAt));
+    }
+    return db.select().from(operationalAuditLogs).orderBy(asc2(operationalAuditLogs.createdAt));
+  })
+});
+
+// server/routers.ts
+var appRouter = router({
+  // if you need to use socket.io, read and register route in server/_core/index.ts, all api should start with '/api/' so that the gateway can route correctly
+  system: systemRouter,
+  auth: router({
+    me: publicProcedure.query((opts) => opts.ctx.user),
+    logout: publicProcedure.mutation(({ ctx }) => {
+      const cookieOptions = getSessionCookieOptions(ctx.req);
+      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      return {
+        success: true
+      };
+    })
+  }),
+  workforce: workforceRouter,
+  operations: operationsRouter
+});
+
+// server/_core/context.ts
+async function createContext(opts) {
+  let user = null;
+  try {
+    user = await sdk.authenticateRequest(opts.req);
+  } catch (error) {
+    user = null;
+  }
+  return {
+    req: opts.req,
+    res: opts.res,
+    user
+  };
+}
+
+// server/_core/vite.ts
+import express from "express";
+import fs2 from "fs";
+import { nanoid } from "nanoid";
+import path2 from "path";
+import { createServer as createViteServer } from "vite";
+
+// vite.config.ts
+import { jsxLocPlugin } from "@builder.io/vite-plugin-jsx-loc";
+import tailwindcss from "@tailwindcss/vite";
+import react from "@vitejs/plugin-react";
+import fs from "node:fs";
+import path from "node:path";
+import { defineConfig } from "vite";
+import { vitePluginManusRuntime } from "vite-plugin-manus-runtime";
+var PROJECT_ROOT = import.meta.dirname;
+var LOG_DIR = path.join(PROJECT_ROOT, ".manus-logs");
+var MAX_LOG_SIZE_BYTES = 1 * 1024 * 1024;
+var TRIM_TARGET_BYTES = Math.floor(MAX_LOG_SIZE_BYTES * 0.6);
+function ensureLogDir() {
+  if (!fs.existsSync(LOG_DIR)) {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+  }
+}
+function trimLogFile(logPath, maxSize) {
+  try {
+    if (!fs.existsSync(logPath) || fs.statSync(logPath).size <= maxSize) {
+      return;
+    }
+    const lines = fs.readFileSync(logPath, "utf-8").split("\n");
+    const keptLines = [];
+    let keptBytes = 0;
+    const targetSize = TRIM_TARGET_BYTES;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const lineBytes = Buffer.byteLength(`${lines[i]}
+`, "utf-8");
+      if (keptBytes + lineBytes > targetSize) break;
+      keptLines.unshift(lines[i]);
+      keptBytes += lineBytes;
+    }
+    fs.writeFileSync(logPath, keptLines.join("\n"), "utf-8");
+  } catch {
+  }
+}
+function writeToLogFile(source, entries) {
+  if (entries.length === 0) return;
+  ensureLogDir();
+  const logPath = path.join(LOG_DIR, `${source}.log`);
+  const lines = entries.map((entry) => {
+    const ts = (/* @__PURE__ */ new Date()).toISOString();
+    return `[${ts}] ${JSON.stringify(entry)}`;
+  });
+  fs.appendFileSync(logPath, `${lines.join("\n")}
+`, "utf-8");
+  trimLogFile(logPath, MAX_LOG_SIZE_BYTES);
+}
+function vitePluginManusDebugCollector() {
+  return {
+    name: "manus-debug-collector",
+    transformIndexHtml(html) {
+      if (process.env.NODE_ENV === "production") {
+        return html;
+      }
+      return {
+        html,
+        tags: [
+          {
+            tag: "script",
+            attrs: {
+              src: "/__manus__/debug-collector.js",
+              defer: true
+            },
+            injectTo: "head"
+          }
+        ]
+      };
+    },
+    configureServer(server) {
+      server.middlewares.use("/__manus__/logs", (req, res, next) => {
+        if (req.method !== "POST") {
+          return next();
+        }
+        const handlePayload = (payload) => {
+          if (payload.consoleLogs?.length > 0) {
+            writeToLogFile("browserConsole", payload.consoleLogs);
+          }
+          if (payload.networkRequests?.length > 0) {
+            writeToLogFile("networkRequests", payload.networkRequests);
+          }
+          if (payload.sessionEvents?.length > 0) {
+            writeToLogFile("sessionReplay", payload.sessionEvents);
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true }));
+        };
+        const reqBody = req.body;
+        if (reqBody && typeof reqBody === "object") {
+          try {
+            handlePayload(reqBody);
+          } catch (e) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ success: false, error: String(e) }));
+          }
+          return;
+        }
+        let body = "";
+        req.on("data", (chunk) => {
+          body += chunk.toString();
+        });
+        req.on("end", () => {
+          try {
+            const payload = JSON.parse(body);
+            handlePayload(payload);
+          } catch (e) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ success: false, error: String(e) }));
+          }
+        });
+      });
+    }
+  };
+}
+var plugins = [react(), tailwindcss(), jsxLocPlugin(), vitePluginManusRuntime(), vitePluginManusDebugCollector()];
+var vite_config_default = defineConfig({
+  plugins,
+  resolve: {
+    alias: {
+      "@": path.resolve(import.meta.dirname, "client", "src"),
+      "@shared": path.resolve(import.meta.dirname, "shared"),
+      "@assets": path.resolve(import.meta.dirname, "attached_assets")
+    }
+  },
+  envDir: path.resolve(import.meta.dirname),
+  root: path.resolve(import.meta.dirname, "client"),
+  publicDir: path.resolve(import.meta.dirname, "client", "public"),
+  build: {
+    outDir: path.resolve(import.meta.dirname, "dist/public"),
+    emptyOutDir: true
+  },
+  server: {
+    host: true,
+    allowedHosts: [
+      ".manuspre.computer",
+      ".manus.computer",
+      ".manus-asia.computer",
+      ".manuscomputer.ai",
+      ".manusvm.computer",
+      "localhost",
+      "127.0.0.1"
+    ],
+    fs: {
+      strict: true,
+      deny: ["**/.*"]
+    }
+  }
+});
+
+// server/_core/vite.ts
+async function setupVite(app, server) {
+  const serverOptions = {
+    middlewareMode: true,
+    hmr: { server },
+    allowedHosts: true
+  };
+  const vite = await createViteServer({
+    ...vite_config_default,
+    configFile: false,
+    server: serverOptions,
+    appType: "custom"
+  });
+  app.use(vite.middlewares);
+  app.use("*", async (req, res, next) => {
+    const url = req.originalUrl;
+    try {
+      const clientTemplate = path2.resolve(
+        import.meta.dirname,
+        "../..",
+        "client",
+        "index.html"
+      );
+      let template = await fs2.promises.readFile(clientTemplate, "utf-8");
+      template = template.replace(
+        `src="/src/main.tsx"`,
+        `src="/src/main.tsx?v=${nanoid()}"`
+      );
+      const page = await vite.transformIndexHtml(url, template);
+      res.status(200).set({ "Content-Type": "text/html" }).end(page);
+    } catch (e) {
+      vite.ssrFixStacktrace(e);
+      next(e);
+    }
+  });
+}
+function serveStatic(app) {
+  const distPath = process.env.NODE_ENV === "development" ? path2.resolve(import.meta.dirname, "../..", "dist", "public") : path2.resolve(import.meta.dirname, "public");
+  if (!fs2.existsSync(distPath)) {
+    console.error(
+      `Could not find the build directory: ${distPath}, make sure to build the client first`
+    );
+  }
+  app.use(express.static(distPath));
+  app.use("*", (_req, res) => {
+    res.sendFile(path2.resolve(distPath, "index.html"));
+  });
+}
+
+// server/app.ts
+async function createFiberOpsApp(server) {
+  const app = express2();
+  app.use(express2.json({ limit: "50mb" }));
+  app.use(express2.urlencoded({ limit: "50mb", extended: true }));
+  registerStorageProxy(app);
+  registerOAuthRoutes(app);
+  app.use(
+    "/api/trpc",
+    createExpressMiddleware({ router: appRouter, createContext })
+  );
+  if (process.env.NODE_ENV === "development" && server) {
+    await setupVite(app, server);
+  } else if (!process.env.VERCEL) {
+    serveStatic(app);
+  }
+  return app;
+}
+
+// server/vercel-handler.ts
+var appPromise;
+async function handler(req, res) {
+  appPromise ??= createFiberOpsApp();
+  const app = await appPromise;
+  return app(req, res);
+}
+export {
+  handler as default
+};
