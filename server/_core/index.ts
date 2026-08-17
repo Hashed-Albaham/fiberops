@@ -2,6 +2,7 @@ import "dotenv/config";
 import { createServer } from "http";
 import net from "net";
 import { createFiberOpsApp } from "../app";
+import { serveStatic, setupVite } from "./vite";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -24,7 +25,14 @@ async function findAvailablePort(startPort: number = 3000): Promise<number> {
 
 async function startServer() {
   const server = createServer();
-  const app = await createFiberOpsApp(server);
+  const app = await createFiberOpsApp();
+
+  if (process.env.NODE_ENV === "development") {
+    await setupVite(app, server);
+  } else {
+    serveStatic(app);
+  }
+
   server.on("request", app);
 
   const preferredPort = parseInt(process.env.PORT || "3000");
