@@ -8,6 +8,13 @@
       "when": 1786978953063,
       "tag": "0000_chilly_gunslinger",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1786990475584,
+      "tag": "0001_oval_xorn",
+      "breakpoints": true
     }
   ]
 }

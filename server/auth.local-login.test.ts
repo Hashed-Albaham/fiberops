@@ -2,8 +2,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COOKIE_NAME } from "../shared/const";
 
 const upsertUser = vi.fn();
+const getUserByUsername = vi.fn();
 
-vi.mock("./db", () => ({ upsertUser }));
+vi.mock("./db", () => ({ upsertUser, getUserByUsername }));
 
 type CookieCall = { name: string; value: string; options: Record<string, unknown> };
 
@@ -27,6 +28,7 @@ describe("auth.login", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
+    getUserByUsername.mockResolvedValue(undefined);
     vi.stubEnv("LOCAL_ADMIN_USERNAME", "local-admin-test");
     vi.stubEnv("LOCAL_ADMIN_PASSWORD", "local-password-test");
     vi.stubEnv("JWT_SECRET", "local-jwt-secret-for-vitest-only");
@@ -65,5 +67,27 @@ describe("auth.login", () => {
 
     expect(upsertUser).not.toHaveBeenCalled();
     expect(cookies).toHaveLength(0);
+  });
+
+  it("creates a session for an active user created by the administrator", async () => {
+    const { hashPassword } = await import("./auth");
+    getUserByUsername.mockResolvedValue({
+      id: 7,
+      openId: "local-user-7",
+      username: "operations.test",
+      passwordHash: await hashPassword("operations-password-test"),
+      active: "yes",
+      role: "operations_manager",
+    });
+    const { appRouter } = await import("./routers");
+    const { ctx, cookies } = createContext();
+
+    await expect(appRouter.createCaller(ctx as never).auth.login({
+      username: "operations.test",
+      password: "operations-password-test",
+    })).resolves.toEqual({ success: true });
+
+    expect(upsertUser).toHaveBeenCalledWith(expect.objectContaining({ openId: "local-user-7" }));
+    expect(cookies).toHaveLength(1);
   });
 });

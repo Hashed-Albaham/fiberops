@@ -11,7 +11,7 @@ import {
   workRoutes,
 } from "../../drizzle/schema";
 import { requireDb } from "../db";
-import { adminProcedure, router } from "../_core/trpc";
+import { adminProcedure, readProcedure, router } from "../_core/trpc";
 
 const dateField = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const optionalDate = dateField.nullable().optional();
@@ -59,7 +59,7 @@ async function audit(actorUserId: number, entityType: string, entityId: number, 
 }
 
 export const operationsRouter = router({
-  list: adminProcedure.query(async () => {
+  list: readProcedure.query(async () => {
     const db = await requireDb();
     const [departmentRows, projectRows, drumRows, equipmentRows, permitRows, routeRows, employeeRows] = await Promise.all([
       db.select().from(departments).orderBy(asc(departments.name)),
@@ -73,7 +73,7 @@ export const operationsRouter = router({
     return { departments: departmentRows, projects: projectRows, drums: drumRows, equipment: equipmentRows, permits: permitRows, routes: routeRows, employees: employeeRows };
   }),
 
-  overview: adminProcedure.query(async () => {
+  overview: readProcedure.query(async () => {
     const db = await requireDb();
     const [employeeRows, drumRows, equipmentRows, permitRows, routeRows] = await Promise.all([db.select().from(employees), db.select().from(fiberDrums), db.select().from(fieldEquipment), db.select().from(permits), db.select().from(workRoutes)]);
     return {

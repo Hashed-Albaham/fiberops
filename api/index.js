@@ -2,86 +2,16 @@
 import express from "express";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 
-// server/_core/env.ts
-var ENV = {
-  appId: process.env.VITE_APP_ID ?? "",
-  cookieSecret: process.env.JWT_SECRET ?? "",
-  localAdminUsername: process.env.LOCAL_ADMIN_USERNAME ?? "",
-  localAdminPassword: process.env.LOCAL_ADMIN_PASSWORD ?? "",
-  databaseUrl: process.env.DATABASE_URL ?? "",
-  oAuthServerUrl: process.env.OAUTH_SERVER_URL ?? "",
-  ownerOpenId: process.env.OWNER_OPEN_ID ?? "",
-  isProduction: process.env.NODE_ENV === "production",
-  forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
-  forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? ""
-};
-
-// server/_core/storageProxy.ts
-function registerStorageProxy(app) {
-  app.get("/manus-storage/*", async (req, res) => {
-    const key = req.params[0];
-    if (!key) {
-      res.status(400).send("Missing storage key");
-      return;
-    }
-    if (!ENV.forgeApiUrl || !ENV.forgeApiKey) {
-      res.status(500).send("Storage proxy not configured");
-      return;
-    }
-    try {
-      const forgeUrl = new URL(
-        "v1/storage/presign/get",
-        ENV.forgeApiUrl.replace(/\/+$/, "") + "/"
-      );
-      forgeUrl.searchParams.set("path", key);
-      const forgeResp = await fetch(forgeUrl, {
-        headers: { Authorization: `Bearer ${ENV.forgeApiKey}` }
-      });
-      if (!forgeResp.ok) {
-        const body = await forgeResp.text().catch(() => "");
-        console.error(`[StorageProxy] forge error: ${forgeResp.status} ${body}`);
-        res.status(502).send("Storage backend error");
-        return;
-      }
-      const { url } = await forgeResp.json();
-      if (!url) {
-        res.status(502).send("Empty signed URL from backend");
-        return;
-      }
-      res.set("Cache-Control", "no-store");
-      res.redirect(307, url);
-    } catch (err) {
-      console.error("[StorageProxy] failed:", err);
-      res.status(502).send("Storage proxy error");
-    }
-  });
-}
-
 // shared/const.ts
 var COOKIE_NAME = "app_session_id";
 var ONE_YEAR_MS = 1e3 * 60 * 60 * 24 * 365;
-var AXIOS_TIMEOUT_MS = 3e4;
 var UNAUTHED_ERR_MSG = "Please login (10001)";
 var NOT_ADMIN_ERR_MSG = "You do not have required permission (10002)";
-var decodeOAuthState = (state) => {
-  let decoded;
-  try {
-    decoded = atob(state);
-  } catch {
-    return { redirectUri: "" };
-  }
-  try {
-    const parsed = JSON.parse(decoded);
-    if (parsed && typeof parsed.redirectUri === "string") return parsed;
-  } catch {
-  }
-  return { redirectUri: decoded };
-};
 
 // server/routers.ts
-import { TRPCError as TRPCError3 } from "@trpc/server";
-import { createHash, timingSafeEqual } from "crypto";
-import { z as z4 } from "zod";
+import { TRPCError as TRPCError2 } from "@trpc/server";
+import { createHash, timingSafeEqual as timingSafeEqual2 } from "crypto";
+import { z as z5 } from "zod";
 
 // server/db.ts
 import { eq } from "drizzle-orm";
@@ -99,13 +29,17 @@ import {
   uniqueIndex,
   varchar
 } from "drizzle-orm/mysql-core";
+var userRoles = ["admin", "operations_manager", "field_supervisor", "viewer"];
 var users = mysqlTable("users", {
   id: int("id").autoincrement().primaryKey(),
   openId: varchar("openId", { length: 64 }).notNull().unique(),
+  username: varchar("username", { length: 80 }).unique(),
+  passwordHash: varchar("passwordHash", { length: 255 }),
   name: text("name"),
   email: varchar("email", { length: 320 }),
   loginMethod: varchar("loginMethod", { length: 64 }),
-  role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
+  role: mysqlEnum("role", userRoles).default("viewer").notNull(),
+  active: mysqlEnum("active", ["yes", "no"]).default("yes").notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull()
@@ -370,6 +304,18 @@ async function upsertUser(user) {
       updateSet[field] = normalized;
     };
     textFields.forEach(assignNullable);
+    if (user.username !== void 0) {
+      values.username = user.username;
+      updateSet.username = user.username;
+    }
+    if (user.passwordHash !== void 0) {
+      values.passwordHash = user.passwordHash;
+      updateSet.passwordHash = user.passwordHash;
+    }
+    if (user.active !== void 0) {
+      values.active = user.active;
+      updateSet.active = user.active;
+    }
     if (user.lastSignedIn !== void 0) {
       values.lastSignedIn = user.lastSignedIn;
       updateSet.lastSignedIn = user.lastSignedIn;
@@ -377,9 +323,6 @@ async function upsertUser(user) {
     if (user.role !== void 0) {
       values.role = user.role;
       updateSet.role = user.role;
-    } else if (user.openId === ENV.ownerOpenId) {
-      values.role = "admin";
-      updateSet.role = "admin";
     }
     if (!values.lastSignedIn) {
       values.lastSignedIn = /* @__PURE__ */ new Date();
@@ -404,6 +347,56 @@ async function getUserByOpenId(openId) {
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
   return result.length > 0 ? result[0] : void 0;
 }
+async function getUserByUsername(username) {
+  const db = await getDb();
+  if (!db) return void 0;
+  const result = await db.select().from(users).where(eq(users.username, username)).limit(1);
+  return result[0];
+}
+
+// server/auth.ts
+import { parse as parseCookies } from "cookie";
+import { randomBytes, scrypt as scryptCallback, timingSafeEqual } from "crypto";
+import { SignJWT, jwtVerify } from "jose";
+import { promisify } from "util";
+var scrypt = promisify(scryptCallback);
+function sessionSecret() {
+  const value = process.env.JWT_SECRET;
+  if (!value || value.length < 32) {
+    throw new Error("JWT_SECRET must contain at least 32 characters.");
+  }
+  return new TextEncoder().encode(value);
+}
+async function createLocalSessionToken(openId, expiresInMs = ONE_YEAR_MS) {
+  const expiresAt = Math.floor((Date.now() + expiresInMs) / 1e3);
+  return new SignJWT({ openId }).setProtectedHeader({ alg: "HS256", typ: "JWT" }).setIssuedAt().setExpirationTime(expiresAt).sign(sessionSecret());
+}
+async function hashPassword(password) {
+  const salt = randomBytes(16).toString("hex");
+  const derived = await scrypt(password, salt, 64);
+  return `${salt}:${derived.toString("hex")}`;
+}
+async function verifyPassword(password, storedHash) {
+  if (!storedHash) return false;
+  const [salt, expected] = storedHash.split(":");
+  if (!salt || !expected) return false;
+  const actual = await scrypt(password, salt, 64);
+  const expectedBuffer = Buffer.from(expected, "hex");
+  return expectedBuffer.length === actual.length && timingSafeEqual(expectedBuffer, actual);
+}
+async function getAuthenticatedUser(req) {
+  const token = parseCookies(req.headers.cookie ?? "")[COOKIE_NAME];
+  if (!token) return null;
+  try {
+    const { payload } = await jwtVerify(token, sessionSecret(), { algorithms: ["HS256"] });
+    const openId = payload.openId;
+    if (typeof openId !== "string" || !openId) return null;
+    const user = await getUserByOpenId(openId);
+    return user?.active === "yes" ? user : null;
+  } catch {
+    return null;
+  }
+}
 
 // server/_core/cookies.ts
 function isSecureRequest(req) {
@@ -422,350 +415,17 @@ function getSessionCookieOptions(req) {
   };
 }
 
-// shared/_core/errors.ts
-var HttpError = class extends Error {
-  constructor(statusCode, message) {
-    super(message);
-    this.statusCode = statusCode;
-    this.name = "HttpError";
-  }
+// server/_core/env.ts
+var ENV = {
+  cookieSecret: process.env.JWT_SECRET ?? "",
+  localAdminUsername: process.env.LOCAL_ADMIN_USERNAME ?? "",
+  localAdminPassword: process.env.LOCAL_ADMIN_PASSWORD ?? "",
+  databaseUrl: process.env.DATABASE_URL ?? "",
+  isProduction: process.env.NODE_ENV === "production"
 };
-var ForbiddenError = (msg) => new HttpError(403, msg);
-
-// server/_core/sdk.ts
-import axios from "axios";
-import { parse as parseCookieHeader } from "cookie";
-import { SignJWT, jwtVerify } from "jose";
-var isNonEmptyString = (value) => typeof value === "string" && value.length > 0;
-var EXCHANGE_TOKEN_PATH = `/webdev.v1.WebDevAuthPublicService/ExchangeToken`;
-var GET_USER_INFO_PATH = `/webdev.v1.WebDevAuthPublicService/GetUserInfo`;
-var GET_USER_INFO_WITH_JWT_PATH = `/webdev.v1.WebDevAuthPublicService/GetUserInfoWithJwt`;
-var OAuthService = class {
-  constructor(client) {
-    this.client = client;
-    console.log("[OAuth] Initialized with baseURL:", ENV.oAuthServerUrl);
-    if (!ENV.oAuthServerUrl) {
-      console.error(
-        "[OAuth] ERROR: OAUTH_SERVER_URL is not configured! Set OAUTH_SERVER_URL environment variable."
-      );
-    }
-  }
-  decodeState(state) {
-    return decodeOAuthState(state).redirectUri;
-  }
-  async getTokenByCode(code, state) {
-    const payload = {
-      clientId: ENV.appId,
-      grantType: "authorization_code",
-      code,
-      redirectUri: this.decodeState(state)
-    };
-    const { data } = await this.client.post(
-      EXCHANGE_TOKEN_PATH,
-      payload
-    );
-    return data;
-  }
-  async getUserInfoByToken(token) {
-    const { data } = await this.client.post(
-      GET_USER_INFO_PATH,
-      {
-        accessToken: token.accessToken
-      }
-    );
-    return data;
-  }
-};
-var createOAuthHttpClient = () => axios.create({
-  baseURL: ENV.oAuthServerUrl,
-  timeout: AXIOS_TIMEOUT_MS
-});
-var SDKServer = class {
-  client;
-  oauthService;
-  constructor(client = createOAuthHttpClient()) {
-    this.client = client;
-    this.oauthService = new OAuthService(this.client);
-  }
-  deriveLoginMethod(platforms, fallback) {
-    if (fallback && fallback.length > 0) return fallback;
-    if (!Array.isArray(platforms) || platforms.length === 0) return null;
-    const set = new Set(
-      platforms.filter((p) => typeof p === "string")
-    );
-    if (set.has("REGISTERED_PLATFORM_EMAIL")) return "email";
-    if (set.has("REGISTERED_PLATFORM_GOOGLE")) return "google";
-    if (set.has("REGISTERED_PLATFORM_APPLE")) return "apple";
-    if (set.has("REGISTERED_PLATFORM_MICROSOFT") || set.has("REGISTERED_PLATFORM_AZURE"))
-      return "microsoft";
-    if (set.has("REGISTERED_PLATFORM_GITHUB")) return "github";
-    const first = Array.from(set)[0];
-    return first ? first.toLowerCase() : null;
-  }
-  /**
-   * Exchange OAuth authorization code for access token
-   * @example
-   * const tokenResponse = await sdk.exchangeCodeForToken(code, state);
-   */
-  async exchangeCodeForToken(code, state) {
-    return this.oauthService.getTokenByCode(code, state);
-  }
-  /**
-   * Get user information using access token
-   * @example
-   * const userInfo = await sdk.getUserInfo(tokenResponse.accessToken);
-   */
-  async getUserInfo(accessToken) {
-    const data = await this.oauthService.getUserInfoByToken({
-      accessToken
-    });
-    const loginMethod = this.deriveLoginMethod(
-      data?.platforms,
-      data?.platform ?? data.platform ?? null
-    );
-    return {
-      ...data,
-      platform: loginMethod,
-      loginMethod
-    };
-  }
-  parseCookies(cookieHeader) {
-    if (!cookieHeader) {
-      return /* @__PURE__ */ new Map();
-    }
-    const parsed = parseCookieHeader(cookieHeader);
-    return new Map(Object.entries(parsed));
-  }
-  getSessionSecret() {
-    const secret = ENV.cookieSecret;
-    return new TextEncoder().encode(secret);
-  }
-  /**
-   * Create a session token for a Manus user openId
-   * @example
-   * const sessionToken = await sdk.createSessionToken(userInfo.openId);
-   */
-  async createSessionToken(openId, options = {}) {
-    return this.signSession(
-      {
-        openId,
-        appId: ENV.appId,
-        name: options.name || ""
-      },
-      options
-    );
-  }
-  async signSession(payload, options = {}) {
-    const issuedAt = Date.now();
-    const expiresInMs = options.expiresInMs ?? ONE_YEAR_MS;
-    const expirationSeconds = Math.floor((issuedAt + expiresInMs) / 1e3);
-    const secretKey = this.getSessionSecret();
-    return new SignJWT({
-      openId: payload.openId,
-      appId: payload.appId,
-      name: payload.name
-    }).setProtectedHeader({ alg: "HS256", typ: "JWT" }).setExpirationTime(expirationSeconds).sign(secretKey);
-  }
-  async verifySession(cookieValue) {
-    if (!cookieValue) {
-      console.warn("[Auth] Missing session cookie");
-      return null;
-    }
-    try {
-      const secretKey = this.getSessionSecret();
-      const { payload } = await jwtVerify(cookieValue, secretKey, {
-        algorithms: ["HS256"]
-      });
-      const { openId, appId, name } = payload;
-      if (!isNonEmptyString(openId) || !isNonEmptyString(appId) || !isNonEmptyString(name)) {
-        console.warn("[Auth] Session payload missing required fields");
-        return null;
-      }
-      return {
-        openId,
-        appId,
-        name
-      };
-    } catch (error) {
-      console.warn("[Auth] Session verification failed", String(error));
-      return null;
-    }
-  }
-  async getUserInfoWithJwt(jwtToken) {
-    const payload = {
-      jwtToken,
-      projectId: ENV.appId
-    };
-    const { data } = await this.client.post(
-      GET_USER_INFO_WITH_JWT_PATH,
-      payload
-    );
-    const loginMethod = this.deriveLoginMethod(
-      data?.platforms,
-      data?.platform ?? data.platform ?? null
-    );
-    return {
-      ...data,
-      platform: loginMethod,
-      loginMethod
-    };
-  }
-  async authenticateRequest(req) {
-    const cookies = this.parseCookies(req.headers.cookie);
-    let sessionToken = cookies.get(COOKIE_NAME);
-    if (!sessionToken) {
-      const authHeader = req.headers.authorization;
-      if (typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
-        sessionToken = authHeader.slice(7);
-      }
-    }
-    const session = await this.verifySession(sessionToken);
-    if (!session) {
-      throw ForbiddenError("Invalid session cookie");
-    }
-    if (session.openId.startsWith(CRON_OPEN_ID_PREFIX)) {
-      const userInfo = await this.getUserInfoWithJwt(sessionToken ?? "");
-      const taskUid = userInfo.taskUid ?? null;
-      if (!taskUid) {
-        throw ForbiddenError("Cron session missing task_uid");
-      }
-      return buildCronUser(userInfo);
-    }
-    const sessionUserId = session.openId;
-    const signedInAt = /* @__PURE__ */ new Date();
-    let user = await getUserByOpenId(sessionUserId);
-    if (!user) {
-      try {
-        const userInfo = await this.getUserInfoWithJwt(sessionToken ?? "");
-        await upsertUser({
-          openId: userInfo.openId,
-          name: userInfo.name || null,
-          email: userInfo.email ?? null,
-          loginMethod: userInfo.loginMethod ?? userInfo.platform ?? null,
-          lastSignedIn: signedInAt
-        });
-        user = await getUserByOpenId(userInfo.openId);
-      } catch (error) {
-        console.error("[Auth] Failed to sync user from OAuth:", error);
-        throw ForbiddenError("Failed to sync user info");
-      }
-    }
-    if (!user) {
-      throw ForbiddenError("User not found");
-    }
-    await upsertUser({
-      openId: user.openId,
-      lastSignedIn: signedInAt
-    });
-    return user;
-  }
-};
-var CRON_OPEN_ID_PREFIX = "cron_";
-function buildCronUser(userInfo) {
-  const now = /* @__PURE__ */ new Date();
-  return {
-    id: -1,
-    openId: userInfo.openId,
-    name: userInfo.name || "Manus Scheduled Task",
-    email: null,
-    loginMethod: null,
-    role: "user",
-    createdAt: now,
-    updatedAt: now,
-    lastSignedIn: now,
-    taskUid: userInfo.taskUid ?? void 0,
-    isCron: true
-  };
-}
-var sdk = new SDKServer();
-
-// server/_core/systemRouter.ts
-import { z } from "zod";
-
-// server/_core/notification.ts
-import { TRPCError } from "@trpc/server";
-var TITLE_MAX_LENGTH = 1200;
-var CONTENT_MAX_LENGTH = 2e4;
-var trimValue = (value) => value.trim();
-var isNonEmptyString2 = (value) => typeof value === "string" && value.trim().length > 0;
-var buildEndpointUrl = (baseUrl) => {
-  const normalizedBase = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-  return new URL(
-    "webdevtoken.v1.WebDevService/SendNotification",
-    normalizedBase
-  ).toString();
-};
-var validatePayload = (input) => {
-  if (!isNonEmptyString2(input.title)) {
-    throw new TRPCError({
-      code: "BAD_REQUEST",
-      message: "Notification title is required."
-    });
-  }
-  if (!isNonEmptyString2(input.content)) {
-    throw new TRPCError({
-      code: "BAD_REQUEST",
-      message: "Notification content is required."
-    });
-  }
-  const title = trimValue(input.title);
-  const content = trimValue(input.content);
-  if (title.length > TITLE_MAX_LENGTH) {
-    throw new TRPCError({
-      code: "BAD_REQUEST",
-      message: `Notification title must be at most ${TITLE_MAX_LENGTH} characters.`
-    });
-  }
-  if (content.length > CONTENT_MAX_LENGTH) {
-    throw new TRPCError({
-      code: "BAD_REQUEST",
-      message: `Notification content must be at most ${CONTENT_MAX_LENGTH} characters.`
-    });
-  }
-  return { title, content };
-};
-async function notifyOwner(payload) {
-  const { title, content } = validatePayload(payload);
-  if (!ENV.forgeApiUrl) {
-    throw new TRPCError({
-      code: "INTERNAL_SERVER_ERROR",
-      message: "Notification service URL is not configured."
-    });
-  }
-  if (!ENV.forgeApiKey) {
-    throw new TRPCError({
-      code: "INTERNAL_SERVER_ERROR",
-      message: "Notification service API key is not configured."
-    });
-  }
-  const endpoint = buildEndpointUrl(ENV.forgeApiUrl);
-  try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        accept: "application/json",
-        authorization: `Bearer ${ENV.forgeApiKey}`,
-        "content-type": "application/json",
-        "connect-protocol-version": "1"
-      },
-      body: JSON.stringify({ title, content })
-    });
-    if (!response.ok) {
-      const detail = await response.text().catch(() => "");
-      console.warn(
-        `[Notification] Failed to notify owner (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`
-      );
-      return false;
-    }
-    return true;
-  } catch (error) {
-    console.warn("[Notification] Error calling notification service:", error);
-    return false;
-  }
-}
 
 // server/_core/trpc.ts
-import { initTRPC, TRPCError as TRPCError2 } from "@trpc/server";
+import { initTRPC, TRPCError } from "@trpc/server";
 import superjson from "superjson";
 var t = initTRPC.context().create({
   transformer: superjson
@@ -775,7 +435,7 @@ var publicProcedure = t.procedure;
 var requireUser = t.middleware(async (opts) => {
   const { ctx, next } = opts;
   if (!ctx.user) {
-    throw new TRPCError2({ code: "UNAUTHORIZED", message: UNAUTHED_ERR_MSG });
+    throw new TRPCError({ code: "UNAUTHORIZED", message: UNAUTHED_ERR_MSG });
   }
   return next({
     ctx: {
@@ -785,11 +445,13 @@ var requireUser = t.middleware(async (opts) => {
   });
 });
 var protectedProcedure = t.procedure.use(requireUser);
+var hasRole = (role, allowedRoles) => allowedRoles.includes(role);
+var readProcedure = protectedProcedure;
 var adminProcedure = t.procedure.use(
   t.middleware(async (opts) => {
     const { ctx, next } = opts;
-    if (!ctx.user || ctx.user.role !== "admin") {
-      throw new TRPCError2({ code: "FORBIDDEN", message: NOT_ADMIN_ERR_MSG });
+    if (!ctx.user || !hasRole(ctx.user.role, ["admin", "operations_manager", "field_supervisor"])) {
+      throw new TRPCError({ code: "FORBIDDEN", message: NOT_ADMIN_ERR_MSG });
     }
     return next({
       ctx: {
@@ -799,43 +461,29 @@ var adminProcedure = t.procedure.use(
     });
   })
 );
-
-// server/_core/systemRouter.ts
-var systemRouter = router({
-  health: publicProcedure.input(
-    z.object({
-      timestamp: z.number().min(0, "timestamp cannot be negative")
-    })
-  ).query(() => ({
-    ok: true
-  })),
-  notifyOwner: adminProcedure.input(
-    z.object({
-      title: z.string().min(1, "title is required"),
-      content: z.string().min(1, "content is required")
-    })
-  ).mutation(async ({ input }) => {
-    const delivered = await notifyOwner(input);
-    return {
-      success: delivered
-    };
+var systemAdminProcedure = t.procedure.use(
+  t.middleware(async (opts) => {
+    if (!opts.ctx.user || opts.ctx.user.role !== "admin") {
+      throw new TRPCError({ code: "FORBIDDEN", message: NOT_ADMIN_ERR_MSG });
+    }
+    return opts.next({ ctx: { ...opts.ctx, user: opts.ctx.user } });
   })
-});
+);
 
 // server/routers/operations.ts
 import { asc, eq as eq2 } from "drizzle-orm";
-import { z as z2 } from "zod";
-var dateField = z2.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+import { z } from "zod";
+var dateField = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 var optionalDate = dateField.nullable().optional();
-var optionalText = z2.string().trim().max(500).nullable().optional();
-var optionalId = z2.number().int().positive().nullable().optional();
-var idInput = z2.object({ id: z2.number().int().positive() });
-var departmentInput = z2.object({ name: z2.string().trim().min(2).max(120), code: z2.string().trim().min(2).max(32), managerName: z2.string().trim().max(160).nullable().optional(), active: z2.enum(["yes", "no"]).default("yes") });
-var projectInput = z2.object({ code: z2.string().trim().min(2).max(40), name: z2.string().trim().min(2).max(180), clientName: z2.string().trim().max(180).nullable().optional(), status: z2.enum(["planning", "active", "paused", "completed"]).default("planning"), startDate: optionalDate, targetDate: optionalDate });
-var drumInput = z2.object({ drumId: z2.string().trim().min(2).max(64), fiberSpec: z2.string().trim().min(2).max(180), coreCount: z2.number().int().min(1).max(288), supplier: z2.string().trim().max(160).nullable().optional(), totalMeters: z2.number().int().positive(), remainingMeters: z2.number().int().min(0), minimumMeters: z2.number().int().min(0).default(0), assignedProjectId: optionalId, storageLocation: z2.string().trim().min(2).max(160) });
-var equipmentInput = z2.object({ assetTag: z2.string().trim().min(2).max(64), name: z2.string().trim().min(2).max(180), category: z2.enum(["splicer", "otdr", "power_meter", "safety", "other"]), serialNumber: z2.string().trim().max(100).nullable().optional(), calibrationDueAt: optionalDate, status: z2.enum(["ready", "assigned", "maintenance", "calibration_due"]).default("ready"), assignedEmployeeId: optionalId });
-var permitInput = z2.object({ permitNo: z2.string().trim().min(2).max(80), issuer: z2.enum(["public_works", "traffic", "municipality", "other"]), routeName: z2.string().trim().min(2).max(220), projectId: optionalId, startDate: dateField, expiryDate: dateField, renewalReference: z2.string().trim().max(80).nullable().optional(), notes: optionalText });
-var routeInput = z2.object({ routeCode: z2.string().trim().min(2).max(64), name: z2.string().trim().min(2).max(220), projectId: optionalId, contractorName: z2.string().trim().max(180).nullable().optional(), stage: z2.enum(["civil", "pulling", "splicing", "otdr", "handover"]).default("civil"), progressPercent: z2.number().int().min(0).max(100), permitId: optionalId, status: z2.enum(["active", "blocked", "completed"]).default("active") });
+var optionalText = z.string().trim().max(500).nullable().optional();
+var optionalId = z.number().int().positive().nullable().optional();
+var idInput = z.object({ id: z.number().int().positive() });
+var departmentInput = z.object({ name: z.string().trim().min(2).max(120), code: z.string().trim().min(2).max(32), managerName: z.string().trim().max(160).nullable().optional(), active: z.enum(["yes", "no"]).default("yes") });
+var projectInput = z.object({ code: z.string().trim().min(2).max(40), name: z.string().trim().min(2).max(180), clientName: z.string().trim().max(180).nullable().optional(), status: z.enum(["planning", "active", "paused", "completed"]).default("planning"), startDate: optionalDate, targetDate: optionalDate });
+var drumInput = z.object({ drumId: z.string().trim().min(2).max(64), fiberSpec: z.string().trim().min(2).max(180), coreCount: z.number().int().min(1).max(288), supplier: z.string().trim().max(160).nullable().optional(), totalMeters: z.number().int().positive(), remainingMeters: z.number().int().min(0), minimumMeters: z.number().int().min(0).default(0), assignedProjectId: optionalId, storageLocation: z.string().trim().min(2).max(160) });
+var equipmentInput = z.object({ assetTag: z.string().trim().min(2).max(64), name: z.string().trim().min(2).max(180), category: z.enum(["splicer", "otdr", "power_meter", "safety", "other"]), serialNumber: z.string().trim().max(100).nullable().optional(), calibrationDueAt: optionalDate, status: z.enum(["ready", "assigned", "maintenance", "calibration_due"]).default("ready"), assignedEmployeeId: optionalId });
+var permitInput = z.object({ permitNo: z.string().trim().min(2).max(80), issuer: z.enum(["public_works", "traffic", "municipality", "other"]), routeName: z.string().trim().min(2).max(220), projectId: optionalId, startDate: dateField, expiryDate: dateField, renewalReference: z.string().trim().max(80).nullable().optional(), notes: optionalText });
+var routeInput = z.object({ routeCode: z.string().trim().min(2).max(64), name: z.string().trim().min(2).max(220), projectId: optionalId, contractorName: z.string().trim().max(180).nullable().optional(), stage: z.enum(["civil", "pulling", "splicing", "otdr", "handover"]).default("civil"), progressPercent: z.number().int().min(0).max(100), permitId: optionalId, status: z.enum(["active", "blocked", "completed"]).default("active") });
 function toDbDate(value) {
   if (value === void 0) return void 0;
   if (value === null) return null;
@@ -864,7 +512,7 @@ async function audit(actorUserId, entityType, entityId, action, summary, before,
   await db.insert(operationalAuditLogs).values({ actorUserId, entityType, entityId, action, summary, beforeJson: before ? JSON.stringify(before) : null, afterJson: after ? JSON.stringify(after) : null });
 }
 var operationsRouter = router({
-  list: adminProcedure.query(async () => {
+  list: readProcedure.query(async () => {
     const db = await requireDb();
     const [departmentRows, projectRows, drumRows, equipmentRows, permitRows, routeRows, employeeRows] = await Promise.all([
       db.select().from(departments).orderBy(asc(departments.name)),
@@ -877,7 +525,7 @@ var operationsRouter = router({
     ]);
     return { departments: departmentRows, projects: projectRows, drums: drumRows, equipment: equipmentRows, permits: permitRows, routes: routeRows, employees: employeeRows };
   }),
-  overview: adminProcedure.query(async () => {
+  overview: readProcedure.query(async () => {
     const db = await requireDb();
     const [employeeRows, drumRows, equipmentRows, permitRows, routeRows] = await Promise.all([db.select().from(employees), db.select().from(fiberDrums), db.select().from(fieldEquipment), db.select().from(permits), db.select().from(workRoutes)]);
     return {
@@ -977,7 +625,7 @@ var operationsRouter = router({
     await audit(ctx.user.id, "equipment", id, "update", `\u062A\u0639\u062F\u064A\u0644 \u0623\u0635\u0644 ${before.assetTag}`, before, values);
     return { success: true };
   }),
-  assignEquipment: adminProcedure.input(z2.object({ id: z2.number().int().positive(), employeeId: z2.number().int().positive() })).mutation(async ({ ctx, input }) => {
+  assignEquipment: adminProcedure.input(z.object({ id: z.number().int().positive(), employeeId: z.number().int().positive() })).mutation(async ({ ctx, input }) => {
     const db = await requireDb();
     const before = (await db.select().from(fieldEquipment).where(eq2(fieldEquipment.id, input.id)).limit(1))[0];
     if (!before) throw new Error("\u0627\u0644\u0645\u0639\u062F\u0629 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F\u0629.");
@@ -1017,7 +665,7 @@ var operationsRouter = router({
     await audit(ctx.user.id, "permit", id, "update", `\u062A\u0639\u062F\u064A\u0644 \u062A\u0635\u0631\u064A\u062D ${before.permitNo}`, before, values);
     return { success: true };
   }),
-  renewPermit: adminProcedure.input(z2.object({ id: z2.number().int().positive(), expiryDate: dateField, renewalReference: z2.string().trim().max(80).nullable().optional(), notes: optionalText })).mutation(async ({ ctx, input }) => {
+  renewPermit: adminProcedure.input(z.object({ id: z.number().int().positive(), expiryDate: dateField, renewalReference: z.string().trim().max(80).nullable().optional(), notes: optionalText })).mutation(async ({ ctx, input }) => {
     const db = await requireDb();
     const before = (await db.select().from(permits).where(eq2(permits.id, input.id)).limit(1))[0];
     if (!before) throw new Error("\u0627\u0644\u062A\u0635\u0631\u064A\u062D \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F.");
@@ -1075,61 +723,61 @@ var operationsRouter = router({
 
 // server/routers/workforce.ts
 import { and, asc as asc2, eq as eq3 } from "drizzle-orm";
-import { z as z3 } from "zod";
-var dateField2 = z3.string().regex(/^\d{4}-\d{2}-\d{2}$/, "\u0627\u0644\u062A\u0627\u0631\u064A\u062E \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0628\u0635\u064A\u063A\u0629 YYYY-MM-DD");
+import { z as z2 } from "zod";
+var dateField2 = z2.string().regex(/^\d{4}-\d{2}-\d{2}$/, "\u0627\u0644\u062A\u0627\u0631\u064A\u062E \u064A\u062C\u0628 \u0623\u0646 \u064A\u0643\u0648\u0646 \u0628\u0635\u064A\u063A\u0629 YYYY-MM-DD");
 var optionalDateField = dateField2.nullable().optional();
-var optionalText2 = z3.string().trim().max(500).nullable().optional();
-var optionalId2 = z3.number().int().positive().nullable().optional();
-var idField = z3.object({ id: z3.number().int().positive() });
-var employeeInput = z3.object({
-  employeeNo: z3.string().trim().min(2).max(40),
-  firstName: z3.string().trim().min(2).max(100),
-  lastName: z3.string().trim().min(2).max(100),
-  jobTitle: z3.string().trim().min(2).max(150),
-  nationality: z3.string().trim().min(2).max(90),
-  phone: z3.string().trim().max(32).nullable().optional(),
-  email: z3.string().trim().email().max(320).nullable().optional(),
-  passportNumber: z3.string().trim().max(64).nullable().optional(),
+var optionalText2 = z2.string().trim().max(500).nullable().optional();
+var optionalId2 = z2.number().int().positive().nullable().optional();
+var idField = z2.object({ id: z2.number().int().positive() });
+var employeeInput = z2.object({
+  employeeNo: z2.string().trim().min(2).max(40),
+  firstName: z2.string().trim().min(2).max(100),
+  lastName: z2.string().trim().min(2).max(100),
+  jobTitle: z2.string().trim().min(2).max(150),
+  nationality: z2.string().trim().min(2).max(90),
+  phone: z2.string().trim().max(32).nullable().optional(),
+  email: z2.string().trim().email().max(320).nullable().optional(),
+  passportNumber: z2.string().trim().max(64).nullable().optional(),
   passportExpiryAt: optionalDateField,
   joiningDate: dateField2,
-  employmentStatus: z3.enum(["active", "on_leave", "suspended", "terminated"]).default("active"),
+  employmentStatus: z2.enum(["active", "on_leave", "suspended", "terminated"]).default("active"),
   departmentId: optionalId2,
   primaryProjectId: optionalId2,
-  emergencyContactName: z3.string().trim().max(160).nullable().optional(),
-  emergencyContactPhone: z3.string().trim().max(32).nullable().optional(),
+  emergencyContactName: z2.string().trim().max(160).nullable().optional(),
+  emergencyContactPhone: z2.string().trim().max(32).nullable().optional(),
   notes: optionalText2
 });
-var residencyInput = z3.object({
-  iqamaNumber: z3.string().trim().min(4).max(64),
-  sponsorName: z3.string().trim().max(180).nullable().optional(),
+var residencyInput = z2.object({
+  iqamaNumber: z2.string().trim().min(4).max(64),
+  sponsorName: z2.string().trim().max(180).nullable().optional(),
   issueDate: optionalDateField,
   expiryDate: dateField2,
-  status: z3.enum(["valid", "expiring", "expired", "under_renewal"]).default("valid"),
-  renewalReference: z3.string().trim().max(80).nullable().optional(),
+  status: z2.enum(["valid", "expiring", "expired", "under_renewal"]).default("valid"),
+  renewalReference: z2.string().trim().max(80).nullable().optional(),
   renewalNotes: optionalText2
 });
-var qualificationInput = z3.object({
-  employeeId: z3.number().int().positive(),
-  name: z3.string().trim().min(2).max(180),
-  issuer: z3.string().trim().min(2).max(180),
-  certificateNumber: z3.string().trim().max(100).nullable().optional(),
+var qualificationInput = z2.object({
+  employeeId: z2.number().int().positive(),
+  name: z2.string().trim().min(2).max(180),
+  issuer: z2.string().trim().min(2).max(180),
+  certificateNumber: z2.string().trim().max(100).nullable().optional(),
   issuedDate: optionalDateField,
   expiryDate: optionalDateField,
-  status: z3.enum(["valid", "expiring", "expired", "not_required"]).default("valid"),
+  status: z2.enum(["valid", "expiring", "expired", "not_required"]).default("valid"),
   notes: optionalText2
 });
-var documentInput = z3.object({
-  employeeId: z3.number().int().positive(),
-  documentType: z3.enum(["passport", "visa", "medical_insurance", "contract", "identity", "other"]),
-  title: z3.string().trim().min(2).max(180),
-  referenceNumber: z3.string().trim().max(100).nullable().optional(),
+var documentInput = z2.object({
+  employeeId: z2.number().int().positive(),
+  documentType: z2.enum(["passport", "visa", "medical_insurance", "contract", "identity", "other"]),
+  title: z2.string().trim().min(2).max(180),
+  referenceNumber: z2.string().trim().max(100).nullable().optional(),
   expiryDate: optionalDateField,
   notes: optionalText2
 });
-var assignmentInput = z3.object({
-  employeeId: z3.number().int().positive(),
-  projectId: z3.number().int().positive(),
-  roleOnProject: z3.string().trim().min(2).max(160),
+var assignmentInput = z2.object({
+  employeeId: z2.number().int().positive(),
+  projectId: z2.number().int().positive(),
+  roleOnProject: z2.string().trim().min(2).max(160),
   startDate: dateField2,
   endDate: optionalDateField,
   notes: optionalText2
@@ -1172,7 +820,7 @@ async function audit2(input) {
   });
 }
 var workforceRouter = router({
-  list: adminProcedure.query(async () => {
+  list: readProcedure.query(async () => {
     const db = await requireDb();
     const [employeeRows, departmentRows, projectRows, residencyRows, qualificationRows, documentRows, assignmentRows] = await Promise.all([
       db.select().from(employees).orderBy(asc2(employees.employeeNo)),
@@ -1199,7 +847,7 @@ var workforceRouter = router({
       projects: projectRows
     };
   }),
-  summary: adminProcedure.query(async () => {
+  summary: readProcedure.query(async () => {
     const db = await requireDb();
     const [employeeRows, residencyRows, qualificationRows] = await Promise.all([
       db.select().from(employees),
@@ -1256,7 +904,7 @@ var workforceRouter = router({
     await audit2({ actorUserId: ctx.user.id, entityType: "employee", entityId: input.id, action: "delete", summary: `\u062D\u0630\u0641 \u0645\u0644\u0641 \u0627\u0644\u0639\u0627\u0645\u0644 ${before.employeeNo}`, before });
     return { success: true };
   }),
-  renewResidency: adminProcedure.input(z3.object({ employeeId: z3.number().int().positive(), expiryDate: dateField2, renewalReference: z3.string().trim().max(80).nullable().optional(), renewalNotes: optionalText2 })).mutation(async ({ ctx, input }) => {
+  renewResidency: adminProcedure.input(z2.object({ employeeId: z2.number().int().positive(), expiryDate: dateField2, renewalReference: z2.string().trim().max(80).nullable().optional(), renewalNotes: optionalText2 })).mutation(async ({ ctx, input }) => {
     const db = await requireDb();
     const before = (await db.select().from(residencyPermits).where(eq3(residencyPermits.employeeId, input.employeeId)).limit(1))[0];
     if (!before) throw new Error("\u0644\u0627 \u064A\u0648\u062C\u062F \u0633\u062C\u0644 \u0625\u0642\u0627\u0645\u0629 \u0645\u0631\u062A\u0628\u0637 \u0628\u0647\u0630\u0627 \u0627\u0644\u0639\u0627\u0645\u0644.");
@@ -1327,12 +975,12 @@ var workforceRouter = router({
     await audit2({ actorUserId: ctx.user.id, entityType: "assignment", entityId: assignmentId, action: "assign", summary: `\u062A\u0639\u064A\u064A\u0646 \u0639\u0627\u0645\u0644 \u0639\u0644\u0649 \u0645\u0634\u0631\u0648\u0639 \u0631\u0642\u0645 ${input.projectId}`, after: input });
     return { id: assignmentId };
   }),
-  updateAssignment: adminProcedure.input(idField.merge(z3.object({
-    projectId: z3.number().int().positive().optional(),
-    roleOnProject: z3.string().trim().min(2).max(160).optional(),
+  updateAssignment: adminProcedure.input(idField.merge(z2.object({
+    projectId: z2.number().int().positive().optional(),
+    roleOnProject: z2.string().trim().min(2).max(160).optional(),
     startDate: dateField2.optional(),
     endDate: optionalDateField,
-    status: z3.enum(["active", "completed", "cancelled"]).optional(),
+    status: z2.enum(["active", "completed", "cancelled"]).optional(),
     notes: optionalText2
   }))).mutation(async ({ ctx, input }) => {
     const db = await requireDb();
@@ -1375,7 +1023,7 @@ var workforceRouter = router({
     await audit2({ actorUserId: ctx.user.id, entityType: "compliance", entityId: 0, action: "update", summary: `\u062A\u062D\u062F\u064A\u062B \u062D\u0627\u0644\u0627\u062A \u0627\u0644\u0627\u0645\u062A\u062B\u0627\u0644: ${changed} \u0633\u062C\u0644\u0627\u064B` });
     return { changed };
   }),
-  listAudit: adminProcedure.input(z3.object({ entityType: z3.string().trim().max(60).optional(), entityId: z3.number().int().positive().optional() }).optional()).query(async ({ input }) => {
+  listAudit: adminProcedure.input(z2.object({ entityType: z2.string().trim().max(60).optional(), entityId: z2.number().int().positive().optional() }).optional()).query(async ({ input }) => {
     const db = await requireDb();
     if (input?.entityType && input.entityId) {
       return db.select().from(operationalAuditLogs).where(and(eq3(operationalAuditLogs.entityType, input.entityType), eq3(operationalAuditLogs.entityId, input.entityId))).orderBy(asc2(operationalAuditLogs.createdAt));
@@ -1384,45 +1032,164 @@ var workforceRouter = router({
   })
 });
 
+// server/routers/users.ts
+import { asc as asc3, eq as eq4 } from "drizzle-orm";
+import { randomUUID } from "crypto";
+import { z as z3 } from "zod";
+var userInput = z3.object({
+  username: z3.string().trim().min(3).max(80).regex(/^[a-zA-Z0-9._-]+$/, "\u0627\u0633\u0645 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u064A\u0642\u0628\u0644 \u0627\u0644\u062D\u0631\u0648\u0641 \u0648\u0627\u0644\u0623\u0631\u0642\u0627\u0645 \u0648\u0627\u0644\u0646\u0642\u0637\u0629 \u0648\u0627\u0644\u0634\u0631\u0637\u0629 \u0641\u0642\u0637."),
+  name: z3.string().trim().min(2).max(160),
+  email: z3.string().trim().email().max(320).nullable().optional(),
+  password: z3.string().min(10).max(128),
+  role: z3.enum(userRoles)
+});
+var updateUserInput = z3.object({
+  id: z3.number().int().positive(),
+  name: z3.string().trim().min(2).max(160).optional(),
+  email: z3.string().trim().email().max(320).nullable().optional(),
+  password: z3.string().min(10).max(128).optional(),
+  role: z3.enum(userRoles).optional(),
+  active: z3.enum(["yes", "no"]).optional()
+});
+async function audit3(actorUserId, entityId, action, summary) {
+  const db = await requireDb();
+  await db.insert(operationalAuditLogs).values({ actorUserId, entityType: "user", entityId, action, summary });
+}
+var usersRouter = router({
+  list: systemAdminProcedure.query(async () => {
+    const db = await requireDb();
+    return db.select({ id: users.id, openId: users.openId, username: users.username, name: users.name, email: users.email, role: users.role, active: users.active, loginMethod: users.loginMethod, lastSignedIn: users.lastSignedIn, createdAt: users.createdAt }).from(users).orderBy(asc3(users.createdAt));
+  }),
+  create: systemAdminProcedure.input(userInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const passwordHash = await hashPassword(input.password);
+    const result = await db.insert(users).values({ openId: `local-${randomUUID()}`, username: input.username, passwordHash, name: input.name, email: input.email ?? null, loginMethod: "local", role: input.role, active: "yes", lastSignedIn: /* @__PURE__ */ new Date() });
+    const value = Array.isArray(result) ? result[0] : result;
+    const id = Number(value.insertId ?? 0);
+    await audit3(ctx.user.id, id, "create", `\u0625\u0636\u0627\u0641\u0629 \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 ${input.username} \u0628\u0627\u0644\u062F\u0648\u0631 ${input.role}`);
+    return { id };
+  }),
+  update: systemAdminProcedure.input(updateUserInput).mutation(async ({ ctx, input }) => {
+    const db = await requireDb();
+    const user = (await db.select().from(users).where(eq4(users.id, input.id)).limit(1))[0];
+    if (!user) throw new Error("\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F.");
+    if (user.openId === "fiberops-local-admin" && (input.active === "no" || input.role && input.role !== "admin")) {
+      throw new Error("\u0644\u0627 \u064A\u0645\u0643\u0646 \u062A\u0639\u0637\u064A\u0644 \u0623\u0648 \u062A\u062E\u0641\u064A\u0636 \u0635\u0644\u0627\u062D\u064A\u0629 \u062D\u0633\u0627\u0628 \u0627\u0644\u0645\u0633\u0624\u0648\u0644 \u0627\u0644\u0623\u0648\u0644\u064A \u0645\u0646 \u0627\u0644\u0648\u0627\u062C\u0647\u0629.");
+    }
+    const { id, password, ...values } = input;
+    const patch = { ...values };
+    if (password) patch.passwordHash = await hashPassword(password);
+    await db.update(users).set(patch).where(eq4(users.id, id));
+    await audit3(ctx.user.id, id, "update", `\u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 ${user.username ?? user.name ?? id}`);
+    return { success: true };
+  })
+});
+
+// server/routers/demo.ts
+import { z as z4 } from "zod";
+function insertedId(result) {
+  const value = Array.isArray(result) ? result[0] : result;
+  return Number(value.insertId ?? 0);
+}
+var demoRouter = router({
+  status: systemAdminProcedure.query(async () => {
+    const db = await requireDb();
+    const rows = await db.select({ id: employees.id }).from(employees).limit(1);
+    return { populated: rows.length > 0 };
+  }),
+  seed: systemAdminProcedure.input(z4.object({ confirmation: z4.literal("\u062A\u0647\u064A\u0626\u0629 \u0628\u064A\u0627\u0646\u0627\u062A \u062A\u062C\u0631\u064A\u0628\u064A\u0629") })).mutation(async ({ ctx }) => {
+    const db = await requireDb();
+    const existing = await db.select({ id: employees.id }).from(employees).limit(1);
+    if (existing.length > 0) {
+      return { inserted: false, message: "\u0644\u0645 \u062A\u064F\u0636\u0641 \u0628\u064A\u0627\u0646\u0627\u062A \u062A\u062C\u0631\u064A\u0628\u064A\u0629 \u0644\u0623\u0646 \u0642\u0627\u0639\u062F\u0629 \u0627\u0644\u062A\u0634\u063A\u064A\u0644 \u062A\u062D\u062A\u0648\u064A \u0628\u0627\u0644\u0641\u0639\u0644 \u0639\u0644\u0649 \u0645\u0644\u0641\u0627\u062A \u0639\u0645\u0627\u0644\u0629." };
+    }
+    const fieldDepartmentId = insertedId(await db.insert(departments).values({ name: "\u0627\u0644\u062A\u0634\u063A\u064A\u0644 \u0627\u0644\u0645\u064A\u062F\u0627\u0646\u064A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A", code: "DEMO-FIELD", managerName: "\u0645\u0633\u0624\u0648\u0644 \u062A\u0634\u063A\u064A\u0644 \u062A\u062C\u0631\u064A\u0628\u064A", active: "yes" }));
+    const nocDepartmentId = insertedId(await db.insert(departments).values({ name: "\u0636\u0645\u0627\u0646 \u0627\u0644\u062C\u0648\u062F\u0629 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A", code: "DEMO-QA", managerName: "\u0645\u0633\u0624\u0648\u0644 \u062C\u0648\u062F\u0629 \u062A\u062C\u0631\u064A\u0628\u064A", active: "yes" }));
+    const riyadhProjectId = insertedId(await db.insert(projects).values({ code: "DEMO-FTTH-RYD-01", name: "\u062A\u0648\u0633\u0639\u0629 FTTH \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A\u0629 \u2014 \u0646\u0637\u0627\u0642 \u0627\u0644\u0631\u064A\u0627\u0636", clientName: "\u062C\u0647\u0629 \u0627\u062E\u062A\u0628\u0627\u0631", status: "active", startDate: /* @__PURE__ */ new Date("2026-01-15"), targetDate: /* @__PURE__ */ new Date("2026-11-30") }));
+    const jeddahProjectId = insertedId(await db.insert(projects).values({ code: "DEMO-FTTH-JED-02", name: "\u0631\u0628\u0637 \u0645\u0646\u0627\u0637\u0642 FTTH \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A\u0629 \u2014 \u0646\u0637\u0627\u0642 \u062C\u062F\u0629", clientName: "\u062C\u0647\u0629 \u0627\u062E\u062A\u0628\u0627\u0631", status: "planning", startDate: /* @__PURE__ */ new Date("2026-08-01"), targetDate: /* @__PURE__ */ new Date("2027-02-28") }));
+    const employeeSeeds = [
+      ["DEMO-001", "\u0633\u0627\u0645\u064A", "\u062A\u062C\u0631\u064A\u0628\u064A", "\u0645\u0634\u0631\u0641 \u062A\u0645\u062F\u064A\u062F", "\u0633\u0639\u0648\u062F\u064A", fieldDepartmentId, riyadhProjectId],
+      ["DEMO-002", "\u0646\u0627\u062F\u0631", "\u062A\u062C\u0631\u064A\u0628\u064A", "\u0641\u0646\u064A \u0644\u062D\u0627\u0645 \u0623\u0644\u064A\u0627\u0641", "\u0645\u0635\u0631\u064A", fieldDepartmentId, riyadhProjectId],
+      ["DEMO-003", "\u0639\u0645\u0631", "\u062A\u062C\u0631\u064A\u0628\u064A", "\u0641\u0646\u064A OTDR", "\u0623\u0631\u062F\u0646\u064A", nocDepartmentId, riyadhProjectId],
+      ["DEMO-004", "\u062E\u0627\u0644\u062F", "\u062A\u062C\u0631\u064A\u0628\u064A", "\u0641\u0646\u064A \u0633\u062D\u0628 \u0643\u0627\u0628\u0644\u0627\u062A", "\u0647\u0646\u062F\u064A", fieldDepartmentId, riyadhProjectId],
+      ["DEMO-005", "\u0645\u0627\u0647\u0631", "\u062A\u062C\u0631\u064A\u0628\u064A", "\u0645\u0631\u0627\u0642\u0628 \u0633\u0644\u0627\u0645\u0629", "\u0628\u0627\u0643\u0633\u062A\u0627\u0646\u064A", nocDepartmentId, jeddahProjectId],
+      ["DEMO-006", "\u0641\u0647\u062F", "\u062A\u062C\u0631\u064A\u0628\u064A", "\u0645\u0646\u0633\u0642 \u062A\u0635\u0627\u0631\u064A\u062D", "\u0633\u0639\u0648\u062F\u064A", nocDepartmentId, jeddahProjectId]
+    ];
+    const employeeIds = [];
+    for (const [employeeNo, firstName, lastName, jobTitle, nationality, departmentId, primaryProjectId] of employeeSeeds) {
+      employeeIds.push(insertedId(await db.insert(employees).values({ employeeNo, firstName, lastName, jobTitle, nationality, phone: "+966500000000", email: `${employeeNo.toLowerCase()}@example.test`, passportNumber: `P-${employeeNo}`, passportExpiryAt: /* @__PURE__ */ new Date("2028-12-31"), joiningDate: /* @__PURE__ */ new Date("2025-01-01"), employmentStatus: "active", departmentId, primaryProjectId, emergencyContactName: "\u0627\u062A\u0635\u0627\u0644 \u062A\u062C\u0631\u064A\u0628\u064A", emergencyContactPhone: "+966511111111", notes: "\u0633\u062C\u0644 \u062A\u062C\u0631\u064A\u0628\u064A \u0642\u0627\u0628\u0644 \u0644\u0644\u062A\u0639\u062F\u064A\u0644 \u0623\u0648 \u0627\u0644\u062D\u0630\u0641." })));
+    }
+    const residencyDates = ["2027-03-15", "2026-09-18", "2026-05-30", "2027-01-12", "2026-10-02", "2027-06-01"];
+    for (let index2 = 0; index2 < employeeIds.length; index2 += 1) {
+      const employeeId = employeeIds[index2];
+      const expiry = residencyDates[index2];
+      await db.insert(residencyPermits).values({ employeeId, iqamaNumber: `DEMO-IQ-${String(index2 + 1).padStart(3, "0")}`, sponsorName: "\u0631\u0627\u0639\u064A \u062A\u062C\u0631\u064A\u0628\u064A", issueDate: /* @__PURE__ */ new Date("2025-01-01"), expiryDate: new Date(expiry), status: index2 === 2 ? "expired" : index2 === 1 || index2 === 4 ? "expiring" : "valid", renewalReference: null, renewalNotes: "\u0628\u064A\u0627\u0646\u0627\u062A \u062A\u062C\u0631\u064A\u0628\u064A\u0629" });
+      await db.insert(employeeQualifications).values({ employeeId, name: index2 === 1 ? "Fiber Optic Splicing" : "\u0633\u0644\u0627\u0645\u0629 \u0645\u0648\u0627\u0642\u0639 \u0627\u0644\u0623\u0644\u064A\u0627\u0641", issuer: "\u0645\u0639\u0647\u062F \u062A\u062F\u0631\u064A\u0628\u064A \u062A\u062C\u0631\u064A\u0628\u064A", certificateNumber: `DEMO-CERT-${index2 + 1}`, issuedDate: /* @__PURE__ */ new Date("2025-02-01"), expiryDate: /* @__PURE__ */ new Date(index2 === 3 ? "2026-06-20" : index2 === 0 ? "2026-09-25" : "2027-02-01"), status: index2 === 3 ? "expired" : index2 === 0 ? "expiring" : "valid", notes: "\u0645\u0624\u0647\u0644 \u062A\u062C\u0631\u064A\u0628\u064A" });
+    }
+    for (const employeeId of employeeIds.slice(0, 4)) {
+      await db.insert(employeeDocuments).values({ employeeId, documentType: "contract", title: "\u0639\u0642\u062F \u0639\u0645\u0644 \u062A\u062C\u0631\u064A\u0628\u064A", referenceNumber: `DEMO-CON-${employeeId}`, expiryDate: /* @__PURE__ */ new Date("2027-12-31"), notes: "\u0648\u062B\u064A\u0642\u0629 \u062A\u062C\u0631\u064A\u0628\u064A\u0629" });
+    }
+    for (let index2 = 0; index2 < employeeIds.slice(0, 5).length; index2 += 1) {
+      const employeeId = employeeIds[index2];
+      await db.insert(employeeAssignments).values({ employeeId, projectId: index2 === 4 ? jeddahProjectId : riyadhProjectId, roleOnProject: index2 === 0 ? "\u0645\u0634\u0631\u0641 \u0641\u0631\u064A\u0642" : "\u0641\u0646\u064A \u062A\u0646\u0641\u064A\u0630", startDate: /* @__PURE__ */ new Date("2026-02-01"), endDate: null, status: "active", notes: "\u062A\u0643\u0644\u064A\u0641 \u062A\u062C\u0631\u064A\u0628\u064A" });
+    }
+    await db.insert(fiberDrums).values([
+      { drumId: "DEMO-DRUM-001", fiberSpec: "G.652D Single Mode", coreCount: 144, supplier: "\u0645\u0648\u0631\u062F \u062A\u062C\u0631\u064A\u0628\u064A", totalMeters: 4e3, remainingMeters: 650, minimumMeters: 800, assignedProjectId: riyadhProjectId, storageLocation: "\u0645\u0633\u062A\u0648\u062F\u0639 \u0627\u0644\u0631\u064A\u0627\u0636 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A", status: "low_stock" },
+      { drumId: "DEMO-DRUM-002", fiberSpec: "G.657A2 Drop Cable", coreCount: 24, supplier: "\u0645\u0648\u0631\u062F \u062A\u062C\u0631\u064A\u0628\u064A", totalMeters: 2500, remainingMeters: 2500, minimumMeters: 500, assignedProjectId: null, storageLocation: "\u0645\u0633\u062A\u0648\u062F\u0639 \u0627\u0644\u0631\u064A\u0627\u0636 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A", status: "available" },
+      { drumId: "DEMO-DRUM-003", fiberSpec: "G.652D Single Mode", coreCount: 96, supplier: "\u0645\u0648\u0631\u062F \u062A\u062C\u0631\u064A\u0628\u064A", totalMeters: 3e3, remainingMeters: 0, minimumMeters: 600, assignedProjectId: riyadhProjectId, storageLocation: "\u0645\u0633\u062A\u0648\u062F\u0639 \u0627\u0644\u0645\u0648\u0642\u0639 \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A", status: "depleted" }
+    ]);
+    await db.insert(fieldEquipment).values([
+      { assetTag: "DEMO-OTDR-001", name: "\u062C\u0647\u0627\u0632 OTDR \u062A\u062C\u0631\u064A\u0628\u064A", category: "otdr", serialNumber: "OTDR-DEMO-01", calibrationDueAt: /* @__PURE__ */ new Date("2026-09-10"), status: "calibration_due", assignedEmployeeId: employeeIds[2] },
+      { assetTag: "DEMO-SP-001", name: "\u0622\u0644\u0629 \u0644\u062D\u0627\u0645 \u0623\u0644\u064A\u0627\u0641 \u062A\u062C\u0631\u064A\u0628\u064A\u0629", category: "splicer", serialNumber: "SP-DEMO-01", calibrationDueAt: /* @__PURE__ */ new Date("2027-03-01"), status: "assigned", assignedEmployeeId: employeeIds[1] },
+      { assetTag: "DEMO-PM-001", name: "\u0645\u0642\u064A\u0627\u0633 \u0642\u062F\u0631\u0629 \u062A\u062C\u0631\u064A\u0628\u064A", category: "power_meter", serialNumber: "PM-DEMO-01", calibrationDueAt: /* @__PURE__ */ new Date("2027-01-15"), status: "ready", assignedEmployeeId: null }
+    ]);
+    const permit1 = insertedId(await db.insert(permits).values({ permitNo: "DEMO-PERMIT-001", issuer: "municipality", routeName: "\u0645\u0633\u0627\u0631 \u062D\u064A \u062A\u062C\u0631\u064A\u0628\u064A \u2014 \u0627\u0644\u0642\u0637\u0627\u0639 \u0623", projectId: riyadhProjectId, startDate: /* @__PURE__ */ new Date("2026-05-01"), expiryDate: /* @__PURE__ */ new Date("2026-09-12"), status: "expiring", renewalReference: "DEMO-RNW-01", notes: "\u062A\u0635\u0631\u064A\u062D \u062A\u062C\u0631\u064A\u0628\u064A" }));
+    const permit2 = insertedId(await db.insert(permits).values({ permitNo: "DEMO-PERMIT-002", issuer: "traffic", routeName: "\u0639\u0628\u0648\u0631 \u062A\u062C\u0631\u064A\u0628\u064A \u2014 \u0627\u0644\u0642\u0637\u0627\u0639 \u0628", projectId: riyadhProjectId, startDate: /* @__PURE__ */ new Date("2026-02-01"), expiryDate: /* @__PURE__ */ new Date("2026-06-15"), status: "expired", renewalReference: null, notes: "\u062A\u0635\u0631\u064A\u062D \u062A\u062C\u0631\u064A\u0628\u064A" }));
+    await db.insert(workRoutes).values([
+      { routeCode: "DEMO-RT-001", name: "\u0645\u0633\u0627\u0631 \u062A\u0645\u062F\u064A\u062F \u062A\u062C\u0631\u064A\u0628\u064A \u2014 \u0627\u0644\u0642\u0637\u0627\u0639 \u0623", projectId: riyadhProjectId, contractorName: "\u0641\u0631\u064A\u0642 \u0627\u062E\u062A\u0628\u0627\u0631", stage: "splicing", progressPercent: 72, permitId: permit1, status: "active" },
+      { routeCode: "DEMO-RT-002", name: "\u0645\u0633\u0627\u0631 \u0639\u0628\u0648\u0631 \u062A\u062C\u0631\u064A\u0628\u064A \u2014 \u0627\u0644\u0642\u0637\u0627\u0639 \u0628", projectId: riyadhProjectId, contractorName: "\u0641\u0631\u064A\u0642 \u0627\u062E\u062A\u0628\u0627\u0631", stage: "civil", progressPercent: 38, permitId: permit2, status: "blocked" },
+      { routeCode: "DEMO-RT-003", name: "\u0645\u0633\u0627\u0631 \u062A\u0648\u0633\u0639\u0629 \u062A\u062C\u0631\u064A\u0628\u064A \u2014 \u0627\u0644\u0642\u0637\u0627\u0639 \u062C", projectId: jeddahProjectId, contractorName: "\u0641\u0631\u064A\u0642 \u0627\u062E\u062A\u0628\u0627\u0631", stage: "pulling", progressPercent: 14, permitId: null, status: "active" }
+    ]);
+    await db.insert(operationalAuditLogs).values({ actorUserId: ctx.user.id, entityType: "demo_seed", entityId: 0, action: "create", summary: "\u062A\u0639\u0628\u0626\u0629 \u0628\u064A\u0627\u0646\u0627\u062A FiberOps \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A\u0629 \u0627\u0644\u0623\u0648\u0644\u0649" });
+    return { inserted: true, message: "\u062A\u0645\u062A \u062A\u0639\u0628\u0626\u0629 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062A\u062C\u0631\u064A\u0628\u064A\u0629 \u0628\u0646\u062C\u0627\u062D. \u064A\u0645\u0643\u0646\u0643 \u062A\u0639\u062F\u064A\u0644 \u0623\u064A \u0633\u062C\u0644 \u0623\u0648 \u062D\u0630\u0641\u0647 \u0645\u0646 \u0627\u0644\u0648\u0627\u062C\u0647\u0629." };
+  })
+});
+
 // server/routers.ts
 function matchesCredential(value, expected) {
   if (!expected) return false;
   const valueDigest = createHash("sha256").update(value).digest();
   const expectedDigest = createHash("sha256").update(expected).digest();
-  return timingSafeEqual(valueDigest, expectedDigest);
+  return timingSafeEqual2(valueDigest, expectedDigest);
 }
 var appRouter = router({
-  // if you need to use socket.io, read and register route in server/_core/index.ts, all api should start with '/api/' so that the gateway can route correctly
-  system: systemRouter,
   auth: router({
     me: publicProcedure.query((opts) => opts.ctx.user),
     login: publicProcedure.input(
-      z4.object({
-        username: z4.string().trim().min(1).max(80),
-        password: z4.string().min(1).max(256)
+      z5.object({
+        username: z5.string().trim().min(1).max(80),
+        password: z5.string().min(1).max(256)
       })
     ).mutation(async ({ ctx, input }) => {
       const usernameMatches = matchesCredential(input.username, ENV.localAdminUsername);
       const passwordMatches = matchesCredential(input.password, ENV.localAdminPassword);
-      if (!usernameMatches || !passwordMatches) {
-        throw new TRPCError3({
+      if (usernameMatches && passwordMatches) {
+        const openId = "fiberops-local-admin";
+        await upsertUser({ openId, name: "\u0645\u0633\u0624\u0648\u0644 FiberOps", email: null, loginMethod: "local", role: "admin", active: "yes", lastSignedIn: /* @__PURE__ */ new Date() });
+        const sessionToken2 = await createLocalSessionToken(openId, ONE_YEAR_MS);
+        const cookieOptions2 = getSessionCookieOptions(ctx.req);
+        ctx.res.cookie(COOKIE_NAME, sessionToken2, { ...cookieOptions2, maxAge: ONE_YEAR_MS });
+        return { success: true };
+      }
+      const user = await getUserByUsername(input.username);
+      if (!user || user.active !== "yes" || !await verifyPassword(input.password, user.passwordHash)) {
+        throw new TRPCError2({
           code: "UNAUTHORIZED",
           message: "\u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062F\u062E\u0648\u0644 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D\u0629."
         });
       }
-      const openId = "fiberops-local-admin";
-      await upsertUser({
-        openId,
-        name: "\u0645\u0633\u0624\u0648\u0644 FiberOps",
-        email: null,
-        loginMethod: "local",
-        role: "admin",
-        lastSignedIn: /* @__PURE__ */ new Date()
-      });
-      const sessionToken = await sdk.createSessionToken(openId, {
-        name: "\u0645\u0633\u0624\u0648\u0644 FiberOps",
-        expiresInMs: ONE_YEAR_MS
-      });
+      await upsertUser({ openId: user.openId, lastSignedIn: /* @__PURE__ */ new Date() });
+      const sessionToken = await createLocalSessionToken(user.openId, ONE_YEAR_MS);
       const cookieOptions = getSessionCookieOptions(ctx.req);
       ctx.res.cookie(COOKIE_NAME, sessionToken, {
         ...cookieOptions,
@@ -1439,17 +1206,15 @@ var appRouter = router({
     })
   }),
   workforce: workforceRouter,
-  operations: operationsRouter
+  operations: operationsRouter,
+  users: usersRouter,
+  demo: demoRouter
 });
 
 // server/_core/context.ts
 async function createContext(opts) {
   let user = null;
-  try {
-    user = await sdk.authenticateRequest(opts.req);
-  } catch (error) {
-    user = null;
-  }
+  user = await getAuthenticatedUser(opts.req);
   return {
     req: opts.req,
     res: opts.res,
@@ -1462,7 +1227,6 @@ async function createFiberOpsApp() {
   const app = express();
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
-  registerStorageProxy(app);
   app.use(
     "/api/trpc",
     createExpressMiddleware({ router: appRouter, createContext })

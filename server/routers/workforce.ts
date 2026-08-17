@@ -11,7 +11,7 @@ import {
   residencyPermits,
 } from "../../drizzle/schema";
 import { requireDb } from "../db";
-import { adminProcedure, router } from "../_core/trpc";
+import { adminProcedure, readProcedure, router } from "../_core/trpc";
 
 const dateField = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "التاريخ يجب أن يكون بصيغة YYYY-MM-DD");
 const optionalDateField = dateField.nullable().optional();
@@ -129,7 +129,7 @@ async function audit(input: {
 }
 
 export const workforceRouter = router({
-  list: adminProcedure.query(async () => {
+  list: readProcedure.query(async () => {
     const db = await requireDb();
     const [employeeRows, departmentRows, projectRows, residencyRows, qualificationRows, documentRows, assignmentRows] = await Promise.all([
       db.select().from(employees).orderBy(asc(employees.employeeNo)),
@@ -157,7 +157,7 @@ export const workforceRouter = router({
     };
   }),
 
-  summary: adminProcedure.query(async () => {
+  summary: readProcedure.query(async () => {
     const db = await requireDb();
     const [employeeRows, residencyRows, qualificationRows] = await Promise.all([
       db.select().from(employees),

@@ -21,7 +21,7 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { useIsMobile } from "@/hooks/useMobile";
-import { Boxes, ClipboardCheck, LayoutDashboard, LogOut, PanelLeft, Route, Users } from "lucide-react";
+import { Boxes, Cable, ClipboardCheck, LayoutDashboard, LogOut, PanelLeft, Route, ShieldCheck, Users } from "lucide-react";
 import { CSSProperties, useEffect, useRef, useState } from "react";
 import { useLocation } from "wouter";
 import { DashboardLayoutSkeleton } from './DashboardLayoutSkeleton';
@@ -34,6 +34,7 @@ const menuItems = [
   { icon: ClipboardCheck, label: "التصاريح والاعتمادات", path: "/operations?tab=permits" },
   { icon: Route, label: "المسارات والمشاريع", path: "/operations?tab=routes" },
 ];
+const adminMenuItem = { icon: ShieldCheck, label: "المستخدمون والصلاحيات", path: "/users" };
 
 const SIDEBAR_WIDTH_KEY = "sidebar-width";
 const DEFAULT_WIDTH = 280;
@@ -81,7 +82,9 @@ export default function DashboardLayout({
       <div dir="rtl" className="flex min-h-screen items-center justify-center bg-[#081017]">
         <form onSubmit={submitLocalLogin} className="flex w-full max-w-md flex-col items-center gap-8 p-8">
           <div className="flex flex-col items-center gap-6">
-            <img src="/manus-storage/fiberops-mark_fc6c0774.png" alt="رمز FiberOps" className="h-16 w-16 rounded-2xl border border-[#2F9BFF]/25 bg-[#2F9BFF]/[0.07] p-2" />
+            <div aria-label="رمز FiberOps" className="flex h-16 w-16 items-center justify-center rounded-2xl border border-[#2F9BFF]/25 bg-[#2F9BFF]/[0.07]">
+              <Cable className="h-8 w-8 text-[#2F9BFF]" />
+            </div>
             <h1 className="text-center text-2xl font-semibold tracking-tight text-white">الوصول التشغيلي المحمي</h1>
             <p className="max-w-sm text-center text-sm leading-7 text-slate-400">أدخل بيانات حساب FiberOps للوصول إلى العمالة والتصاريح والأصول المسجلة.</p>
           </div>
@@ -155,7 +158,8 @@ function DashboardLayoutContent({
   const isCollapsed = state === "collapsed";
   const [isResizing, setIsResizing] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
-  const activeMenuItem = menuItems.find(item => item.path === location);
+  const visibleMenuItems = user?.role === "admin" ? [...menuItems, adminMenuItem] : menuItems;
+  const activeMenuItem = visibleMenuItems.find(item => item.path === location);
   const isMobile = useIsMobile();
 
   useEffect(() => {
@@ -215,7 +219,9 @@ function DashboardLayoutContent({
               {!isCollapsed ? (
                 <div className="flex items-center gap-2 min-w-0">
                   <div className="flex items-center gap-2">
-                    <img src="/manus-storage/fiberops-mark_fc6c0774.png" alt="رمز FiberOps" className="h-7 w-7 rounded-lg object-contain" />
+                    <div aria-label="رمز FiberOps" className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#2F9BFF]/10">
+                      <Cable className="h-4 w-4 text-[#2F9BFF]" />
+                    </div>
                     <span className="truncate font-mono font-semibold tracking-tight text-white">FiberOps</span>
                   </div>
                 </div>
@@ -225,7 +231,7 @@ function DashboardLayoutContent({
 
           <SidebarContent className="gap-0">
             <SidebarMenu className="px-2 py-1">
-              {menuItems.map(item => {
+              {visibleMenuItems.map(item => {
                 const isActive = location === item.path;
                 return (
                   <SidebarMenuItem key={item.path}>

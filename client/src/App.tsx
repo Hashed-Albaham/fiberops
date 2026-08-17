@@ -8,6 +8,7 @@ import { ThemeProvider } from "./contexts/ThemeContext";
 import DashboardLayout from "./components/DashboardLayout";
 import Home from "./pages/Home";
 import Operations from "./pages/Operations";
+import UserManagement from "./pages/UserManagement";
 import Workforce from "./pages/Workforce";
 
 function Router() {
@@ -18,6 +19,7 @@ function Router() {
         <Route path={"/"} component={Home} />
         <Route path={"/workforce"} component={Workforce} />
         <Route path={"/operations"} component={Operations} />
+        <Route path={"/users"} component={UserManagement} />
         <Route path={"/404"} component={NotFound} />
         <Route component={NotFound} />
       </Switch>
